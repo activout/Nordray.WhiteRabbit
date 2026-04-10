@@ -1,6 +1,8 @@
 using System.Security.Claims;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Primitives;
 using Nordray.WhiteRabbit.Core.Services;
 
 namespace Nordray.WhiteRabbit.AuthProxy;
@@ -61,11 +63,32 @@ public sealed class DexAuthProxyMiddleware(RequestDelegate next)
         if (email is not null)
             context.Items[RemoteUserKey] = email;
 
+        // Strip capability scopes before forwarding to Dex — Dex only understands
+        // standard OIDC scopes. Capabilities have already been verified above.
+        StripCapabilityScopes(context);
+
         await next(context);
     }
 
     public static string? GetRemoteUser(HttpContext context) =>
         context.Items.TryGetValue(RemoteUserKey, out var val) ? val as string : null;
+
+    private static void StripCapabilityScopes(HttpContext context)
+    {
+        var scopeParam = context.Request.Query["scope"].ToString();
+        if (string.IsNullOrEmpty(scopeParam)) return;
+
+        var dexScopes = scopeParam
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Where(OidcStandardScopes.Contains)
+            .ToList();
+
+        var query = QueryHelpers.ParseQuery(context.Request.QueryString.Value);
+        query["scope"] = new StringValues(string.Join(" ", dexScopes));
+        context.Request.QueryString = QueryString.Create(
+            query.SelectMany(kvp => kvp.Value.Select(v =>
+                KeyValuePair.Create(kvp.Key, (string?)v))));
+    }
 
     private static HashSet<string> ParseCapabilities(string scope) =>
         scope.Split(' ', StringSplitOptions.RemoveEmptyEntries)
