@@ -1,6 +1,7 @@
 using System.Security.Claims;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.RateLimiting;
 using Nordray.WhiteRabbit.AuthProxy;
 using Nordray.WhiteRabbit.Bunny;
@@ -23,7 +24,7 @@ builder.Configuration.AddEnvironmentVariables(prefix: "WhiteRabbit_");
 
 var configuration = builder.Configuration;
 
-// --- Infrastructure (DB, email, login codes, grants) ---
+// --- Infrastructure (DB, email, login codes, grants, audit) ---
 builder.Services.AddInfrastructure(configuration);
 
 // Create the registry before DI is built so we can use it to generate YARP routes.
@@ -53,8 +54,8 @@ builder.Services.AddAuthentication(options =>
     options.LoginPath = "/login";
     options.Cookie.Name = "WhiteRabbit.Session";
     options.Cookie.HttpOnly = true;
-    options.Cookie.SameSite = SameSiteMode.Lax;
-    options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+    options.Cookie.SameSite = SameSiteMode.Strict;
+    options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
     options.ExpireTimeSpan = TimeSpan.FromHours(8);
 })
 .AddJwtBearer(JwtBearerDefaults.AuthenticationScheme, options =>
@@ -62,7 +63,7 @@ builder.Services.AddAuthentication(options =>
     // Dex is the token authority. White Rabbit proxies its well-known endpoints
     // so the issuer URL is White Rabbit's own address in production.
     options.Authority = configuration["Dex:IssuerUrl"];
-    options.RequireHttpsMetadata = false; // HTTPS enforced at the edge in production
+    options.RequireHttpsMetadata = !builder.Environment.IsDevelopment();
     options.TokenValidationParameters = new()
     {
         ValidateAudience = false, // Audience varies per client; issuer + signature are sufficient
@@ -81,6 +82,16 @@ builder.Services.AddRateLimiter(opts =>
         o.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
         o.QueueLimit = 0;
     });
+
+    // Stricter limit on code verification to prevent brute-force of 6-digit codes.
+    opts.AddFixedWindowLimiter("login-verify", o =>
+    {
+        o.PermitLimit = 10;
+        o.Window = TimeSpan.FromMinutes(15);
+        o.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+        o.QueueLimit = 0;
+    });
+
     opts.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 });
 
@@ -186,6 +197,12 @@ builder.Services.AddRazorPages();
 var app = builder.Build();
 // -----------------------------------------------------------------------
 
+// Create a named data protector for encrypting/decrypting stored bunny API keys.
+// The purpose string is versioned so it can be rotated in the future.
+var bunnyKeyProtector = app.Services
+    .GetRequiredService<IDataProtectionProvider>()
+    .CreateProtector("BunnyApiKey.v1");
+
 // Ensure database schema exists and capabilities are seeded before serving requests
 await app.Services.GetRequiredService<DatabaseInitializer>().InitializeAsync();
 using (var scope = app.Services.CreateScope())
@@ -212,8 +229,8 @@ app.MapGet("/.well-known/ready", (DatabaseInitializer _) => Results.Ok(new { sta
 app.MapRazorPages();
 
 // --- YARP (Dex + Bunny proxy) ---
-// The pipeline middleware enforces auth, capability grants, and credential injection
-// for bunny routes before YARP forwards the request.
+// The pipeline middleware enforces auth, OIDC client requirement, capability grants,
+// and credential injection for bunny routes before YARP forwards the request.
 app.MapReverseProxy(proxyPipeline =>
 {
     proxyPipeline.Use(async (ctx, next) =>
@@ -222,38 +239,50 @@ app.MapReverseProxy(proxyPipeline =>
         if (route?.Config.RouteId.StartsWith("bunny.", StringComparison.Ordinal) == true)
         {
             var metadata = route.Config.Metadata!;
+            var audit = ctx.RequestServices.GetRequiredService<IAuditService>();
+            var operationId = route.Config.RouteId["bunny.".Length..];
 
             // 1. Require authentication
             if (ctx.User.Identity?.IsAuthenticated != true)
             {
                 ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                await audit.RecordAsync(operationId, null, null, "denied_unauthenticated", 401);
+                return;
+            }
+
+            // 2. The proxy is only accessible via OIDC client tokens (azp claim required).
+            //    Cookie-session users are directed to use a registered OIDC client instead.
+            var clientId = ctx.User.FindFirstValue("azp");
+            if (clientId is null)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync(
+                    """{"error":"proxy_requires_oidc","detail":"The proxy is only accessible via OIDC client tokens. Use a registered client application."}""");
+                await audit.RecordAsync(operationId, ctx.User.FindFirstValue(ClaimTypes.Email), null, "denied_no_oidc_client", 403);
                 return;
             }
 
             var email = ctx.User.FindFirstValue(ClaimTypes.Email);
 
-            // 2. Capability check for JWT clients (azp claim = OIDC client_id).
-            //    Cookie-authenticated users own the account and skip this check.
+            // 3. Capability check — every JWT client must have an explicit grant.
             if (metadata["AuthOnly"] != "true")
             {
-                var clientId = ctx.User.FindFirstValue("azp");
-                if (clientId is not null && email is not null)
+                var capability = metadata["Capability"];
+                var grants = ctx.RequestServices.GetRequiredService<IGrantService>();
+                var granted = await grants.GetGrantedCapabilitiesAsync(email ?? "", clientId);
+                if (!granted.Contains(capability))
                 {
-                    var capability = metadata["Capability"];
-                    var grants = ctx.RequestServices.GetRequiredService<IGrantService>();
-                    var granted = await grants.GetGrantedCapabilitiesAsync(email, clientId);
-                    if (!granted.Contains(capability))
-                    {
-                        ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
-                        ctx.Response.ContentType = "application/json";
-                        await ctx.Response.WriteAsync(
-                            $$"""{"error":"capability_not_granted","required":"{{capability}}"}""");
-                        return;
-                    }
+                    ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+                    ctx.Response.ContentType = "application/json";
+                    await ctx.Response.WriteAsync(
+                        $$"""{"error":"capability_not_granted","required":"{{capability}}"}""");
+                    await audit.RecordAsync(operationId, email, clientId, "denied_capability", 403);
+                    return;
                 }
             }
 
-            // 3. Inject the user's own bunny.net API key via Items so the transform
+            // 4. Inject the user's own bunny.net API key via Items so the transform
             //    can add it to the proxy request after header copying.
             if (metadata["CredentialKind"] == "AccountApiKey")
             {
@@ -265,10 +294,32 @@ app.MapReverseProxy(proxyPipeline =>
                     ctx.Response.ContentType = "application/json";
                     await ctx.Response.WriteAsync(
                         """{"error":"bunny_api_key_not_configured","detail":"Go to /settings to add your bunny.net API key."}""");
+                    await audit.RecordAsync(operationId, email, clientId, "denied_no_api_key", 403);
                     return;
                 }
-                ctx.Items["bunny.access-key"] = user.BunnyApiKey;
+
+                // Decrypt the stored API key. If decryption fails the key was stored
+                // as plaintext before encryption was introduced — treat as missing.
+                string plaintextKey;
+                try
+                {
+                    plaintextKey = bunnyKeyProtector.Unprotect(user.BunnyApiKey);
+                }
+                catch (System.Security.Cryptography.CryptographicException)
+                {
+                    ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+                    ctx.Response.ContentType = "application/json";
+                    await ctx.Response.WriteAsync(
+                        """{"error":"bunny_api_key_not_configured","detail":"Your API key needs to be re-entered. Go to /settings to update it."}""");
+                    await audit.RecordAsync(operationId, email, clientId, "denied_key_decryption_failed", 403);
+                    return;
+                }
+                ctx.Items["bunny.access-key"] = plaintextKey;
             }
+
+            await next();
+            await audit.RecordAsync(operationId, email, clientId, "allowed", ctx.Response.StatusCode);
+            return;
         }
 
         await next();

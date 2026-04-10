@@ -16,11 +16,16 @@ public sealed class CapabilitySeeder(IDbConnection db, BunnyOperationRegistry re
         var now = DateTimeOffset.UtcNow.ToString("O");
         var seeded = new HashSet<string>();
 
-        foreach (var op in registry.GetAll())
-        {
-            if (op.RequiredCapability is null) continue;
-            if (!seeded.Add(op.RequiredCapability)) continue;
+        // Group by capability and take the lexicographically first OperationId as the
+        // canonical source of DisplayName/Description, making seeding deterministic
+        // regardless of the order operations appear in the registry.
+        var capabilityOps = registry.GetAll()
+            .Where(op => op.RequiredCapability is not null)
+            .GroupBy(op => op.RequiredCapability!)
+            .Select(g => g.OrderBy(op => op.OperationId).First());
 
+        foreach (var op in capabilityOps)
+        {
             await db.ExecuteAsync("""
                 INSERT OR IGNORE INTO Capabilities (Name, DisplayName, Description, CreatedUtc)
                 VALUES (@name, @displayName, @description, @now)

@@ -30,37 +30,51 @@ public sealed class GrantService(IDbConnection db) : IGrantService
         var capList = capabilities.ToList();
         var now = DateTimeOffset.UtcNow.ToString("O");
 
-        var userId = await db.ExecuteScalarAsync<long?>(
-            "SELECT Id FROM Users WHERE Email = @userEmail", new { userEmail });
-        if (userId is null)
-            throw new InvalidOperationException($"User not found: {userEmail}");
+        if (db.State != System.Data.ConnectionState.Open)
+            db.Open();
 
-        // Auto-register the client on first consent
-        await db.ExecuteAsync(
-            "INSERT OR IGNORE INTO OAuthClients (ClientId, ClientName, IsActive, CreatedUtc) VALUES (@clientId, @clientId, 1, @now)",
-            new { clientId, now });
-        var oauthClientId = await db.ExecuteScalarAsync<long>(
-            "SELECT Id FROM OAuthClients WHERE ClientId = @clientId", new { clientId });
-
-        // Revoke any existing active grant and replace it
-        await db.ExecuteAsync(
-            "UPDATE Grants SET RevokedUtc = @now WHERE UserId = @userId AND ClientId = @oauthClientId AND RevokedUtc IS NULL",
-            new { now, userId, oauthClientId });
-
-        await db.ExecuteAsync(
-            "INSERT INTO Grants (UserId, ClientId, CreatedUtc) VALUES (@userId, @oauthClientId, @now)",
-            new { userId, oauthClientId, now });
-        var grantId = await db.ExecuteScalarAsync<long>("SELECT last_insert_rowid()");
-
-        foreach (var cap in capList)
+        using var tx = db.BeginTransaction();
+        try
         {
-            var capId = await db.ExecuteScalarAsync<long?>(
-                "SELECT Id FROM Capabilities WHERE Name = @cap", new { cap });
-            if (capId is null) continue;
+            var userId = await db.ExecuteScalarAsync<long?>(
+                "SELECT Id FROM Users WHERE Email = @userEmail", new { userEmail }, tx);
+            if (userId is null)
+                throw new InvalidOperationException($"User not found: {userEmail}");
+
+            // Auto-register the client on first consent
+            await db.ExecuteAsync(
+                "INSERT OR IGNORE INTO OAuthClients (ClientId, ClientName, IsActive, CreatedUtc) VALUES (@clientId, @clientId, 1, @now)",
+                new { clientId, now }, tx);
+            var oauthClientId = await db.ExecuteScalarAsync<long>(
+                "SELECT Id FROM OAuthClients WHERE ClientId = @clientId", new { clientId }, tx);
+
+            // Revoke any existing active grant and replace it
+            await db.ExecuteAsync(
+                "UPDATE Grants SET RevokedUtc = @now WHERE UserId = @userId AND ClientId = @oauthClientId AND RevokedUtc IS NULL",
+                new { now, userId, oauthClientId }, tx);
 
             await db.ExecuteAsync(
-                "INSERT OR IGNORE INTO GrantCapabilities (GrantId, CapabilityId) VALUES (@grantId, @capId)",
-                new { grantId, capId });
+                "INSERT INTO Grants (UserId, ClientId, CreatedUtc) VALUES (@userId, @oauthClientId, @now)",
+                new { userId, oauthClientId, now }, tx);
+            var grantId = await db.ExecuteScalarAsync<long>("SELECT last_insert_rowid()", transaction: tx);
+
+            foreach (var cap in capList)
+            {
+                var capId = await db.ExecuteScalarAsync<long?>(
+                    "SELECT Id FROM Capabilities WHERE Name = @cap", new { cap }, tx);
+                if (capId is null) continue;
+
+                await db.ExecuteAsync(
+                    "INSERT OR IGNORE INTO GrantCapabilities (GrantId, CapabilityId) VALUES (@grantId, @capId)",
+                    new { grantId, capId }, tx);
+            }
+
+            tx.Commit();
+        }
+        catch
+        {
+            tx.Rollback();
+            throw;
         }
     }
 }

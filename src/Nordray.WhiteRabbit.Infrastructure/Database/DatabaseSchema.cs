@@ -92,5 +92,7 @@ internal static class DatabaseSchema
     public static readonly string[] Migrations =
     [
         "ALTER TABLE Users ADD COLUMN BunnyApiKey TEXT",
+        "ALTER TABLE LoginCodes ADD COLUMN CodeSalt TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE LoginCodes ADD COLUMN FailedAttempts INTEGER NOT NULL DEFAULT 0",
     ];
 }

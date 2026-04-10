@@ -9,4 +9,6 @@ public sealed class LoginCode
     public DateTimeOffset ExpiresUtc { get; init; }
     public DateTimeOffset? ConsumedUtc { get; init; }
     public string RequestIp { get; init; } = "";
+    public string CodeSalt { get; init; } = "";
+    public int FailedAttempts { get; init; }
 }

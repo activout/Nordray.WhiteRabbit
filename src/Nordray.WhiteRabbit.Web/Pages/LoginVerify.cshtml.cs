@@ -3,12 +3,14 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
+using Microsoft.AspNetCore.RateLimiting;
 using Nordray.WhiteRabbit.Core.Models;
 using Nordray.WhiteRabbit.Core.Services;
 using Nordray.WhiteRabbit.Infrastructure.Database;
 
 namespace Nordray.WhiteRabbit.Web.Pages;
 
+[EnableRateLimiting("login-verify")]
 public sealed class LoginVerifyModel(
     ILoginCodeService loginCodes,
     IUserRepository users,

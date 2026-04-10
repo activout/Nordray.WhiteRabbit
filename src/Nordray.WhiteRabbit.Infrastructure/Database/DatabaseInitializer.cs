@@ -25,5 +25,13 @@ public sealed class DatabaseInitializer(string connectionString)
             try { await connection.ExecuteAsync(migration); }
             catch { /* column already exists — safe to ignore */ }
         }
+
+        // Remove expired and old consumed codes to keep the table from growing unbounded.
+        var cutoff = DateTimeOffset.UtcNow.AddHours(-24).ToString("O");
+        await connection.ExecuteAsync("""
+            DELETE FROM LoginCodes
+            WHERE ExpiresUtc < @cutoff
+               OR (ConsumedUtc IS NOT NULL AND ConsumedUtc < @cutoff)
+            """, new { cutoff });
     }
 }

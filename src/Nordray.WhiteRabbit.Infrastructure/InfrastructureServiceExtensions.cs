@@ -8,6 +8,7 @@ using Microsoft.Extensions.Options;
 using Nordray.WhiteRabbit.Core.Services;
 using Nordray.WhiteRabbit.Infrastructure.Database;
 using Nordray.WhiteRabbit.Infrastructure.Email;
+using Nordray.WhiteRabbit.Infrastructure.Audit;
 using Nordray.WhiteRabbit.Infrastructure.Grants;
 using Nordray.WhiteRabbit.Infrastructure.LoginCodes;
 
@@ -57,6 +58,9 @@ public static class InfrastructureServiceExtensions
 
         // --- Grants ---
         services.AddScoped<IGrantService, GrantService>();
+
+        // --- Audit ---
+        services.AddScoped<IAuditService, AuditService>();
 
         return services;
     }

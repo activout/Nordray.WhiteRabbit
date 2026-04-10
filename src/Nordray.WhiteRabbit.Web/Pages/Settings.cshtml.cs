@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
 using Nordray.WhiteRabbit.Infrastructure.Database;
@@ -7,8 +8,10 @@ using Nordray.WhiteRabbit.Infrastructure.Database;
 namespace Nordray.WhiteRabbit.Web.Pages;
 
 [Authorize]
-public sealed class SettingsModel(IUserRepository users) : PageModel
+public sealed class SettingsModel(IUserRepository users, IDataProtectionProvider dataProtection) : PageModel
 {
+    private readonly IDataProtector _protector = dataProtection.CreateProtector("BunnyApiKey.v1");
+
     [BindProperty]
     public string ApiKey { get; set; } = "";
 
@@ -35,7 +38,7 @@ public sealed class SettingsModel(IUserRepository users) : PageModel
             return Page();
         }
 
-        await users.UpdateBunnyApiKeyAsync(user.Id, ApiKey.Trim());
+        await users.UpdateBunnyApiKeyAsync(user.Id, _protector.Protect(ApiKey.Trim()));
         HasApiKey = true;
         SuccessMessage = "API key saved.";
         return Page();

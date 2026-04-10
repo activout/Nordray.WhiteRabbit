@@ -45,7 +45,8 @@ public sealed class ConsentModel(IGrantService grants, BunnyOperationRegistry re
         // send the client a proper error redirect instead of leaving them hanging.
         var oidcParams = ParseOidcParams(ReturnUrl);
         if (oidcParams.TryGetValue("redirect_uri", out var redirectUri)
-            && Uri.TryCreate(redirectUri, UriKind.Absolute, out _))
+            && Uri.TryCreate(redirectUri, UriKind.Absolute, out var redirectUriParsed)
+            && IsAllowedRedirectScheme(redirectUriParsed))
         {
             oidcParams.TryGetValue("state", out var state);
             var errorUrl = QueryHelpers.AddQueryString(redirectUri,
@@ -60,6 +61,12 @@ public sealed class ConsentModel(IGrantService grants, BunnyOperationRegistry re
 
         return RedirectToPage("/Index");
     }
+
+    // Only allow https:// and http://localhost redirect targets to prevent open-redirect
+    // attacks via non-web schemes (javascript:, file:, data:, etc.).
+    private static bool IsAllowedRedirectScheme(Uri uri) =>
+        uri.Scheme == Uri.UriSchemeHttps ||
+        (uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback);
 
     private void Populate(string returnUrl)
     {
