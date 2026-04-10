@@ -1,3 +1,4 @@
+using System.Security.Claims;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.RateLimiting;
@@ -110,11 +111,15 @@ builder.Services.AddReverseProxy()
     .LoadFromMemory(dexRoutes, dexClusters)
     .AddTransforms(ctx =>
     {
-        if (ctx.Route.RouteId == "dex-auth")
+        // The Dex authproxy connector requires X-Remote-User on every request it handles:
+        // - /auth/white-rabbit-authproxy  (DexAuthProxyMiddleware has run → email in Items)
+        // - /callback/white-rabbit-authproxy  (no middleware → read email from claims)
+        if (ctx.Route.RouteId is "dex-auth" or "dex-callback")
         {
             ctx.AddRequestTransform(transform =>
             {
-                var email = DexAuthProxyMiddleware.GetRemoteUser(transform.HttpContext);
+                var email = DexAuthProxyMiddleware.GetRemoteUser(transform.HttpContext)
+                         ?? transform.HttpContext.User.FindFirstValue(ClaimTypes.Email);
                 if (email is not null)
                     transform.ProxyRequest.Headers.TryAddWithoutValidation("X-Remote-User", email);
                 return ValueTask.CompletedTask;
