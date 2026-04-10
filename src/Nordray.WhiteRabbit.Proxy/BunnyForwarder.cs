@@ -1,4 +1,6 @@
+using System.Net;
 using System.Net.Security;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Claims;
 using System.Security.Cryptography.X509Certificates;
@@ -35,9 +37,21 @@ public static class BunnyForwarder
         AllowAutoRedirect = false,
         UseCookies = false,
         ConnectTimeout = TimeSpan.FromSeconds(15),
-        SslOptions = new SslClientAuthenticationOptions
+        // Explicit ConnectCallback gives direct control over SNI and certificate validation.
+        // Without this, SocketsHttpHandler may derive SNI from a Host header that YARP has
+        // already overwritten with the inbound request's host (localhost:8080).
+        ConnectCallback = async (context, cancellationToken) =>
         {
-            RemoteCertificateValidationCallback = ValidateAgainstIsrgRootX1,
+            var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+            await socket.ConnectAsync(context.DnsEndPoint, cancellationToken);
+            var sslStream = new SslStream(new NetworkStream(socket, ownsSocket: true));
+            await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+            {
+                TargetHost = "api.bunny.net",   // explicit SNI — never inherits from Host header
+                ApplicationProtocols = [SslApplicationProtocol.Http2, SslApplicationProtocol.Http11],
+                RemoteCertificateValidationCallback = ValidateAgainstIsrgRootX1,
+            }, cancellationToken);
+            return sslStream;
         },
     });
 
@@ -154,6 +168,9 @@ public static class BunnyForwarder
             await base.TransformRequestAsync(httpContext, proxyRequest, destinationPrefix, cancellationToken);
             var query = httpContext.Request.QueryString.Value ?? "";
             proxyRequest.RequestUri = new Uri($"https://api.bunny.net/{pathSuffix}{query}");
+            // Explicitly set Host so bunny.net receives the correct value regardless of
+            // what YARP copied from the inbound request (which would be localhost:8080).
+            proxyRequest.Headers.Host = "api.bunny.net";
         }
     }
 }
