@@ -1,0 +1,41 @@
+@page
+@model ConsentModel
+@{
+    ViewData["Title"] = "Authorize access";
+}
+
+<h1>Authorize access</h1>
+
+<p><strong>@Model.ClientId</strong> is requesting access to your bunny.net account.</p>
+
+@if (Model.Capabilities.Count > 0)
+{
+    <h2>Requested capabilities</h2>
+    <ul>
+        @foreach (var cap in Model.Capabilities)
+        {
+            <li>
+                <strong>@cap.DisplayName</strong> — @cap.Description
+                <small>(@cap.Name)</small>
+            </li>
+        }
+    </ul>
+}
+
+@if (Model.AuthOnlyOperations.Count > 0)
+{
+    <h2>Basic authenticated access</h2>
+    <p>These operations require login but do not require extra delegated capability approval.</p>
+    <ul>
+        @foreach (var op in Model.AuthOnlyOperations)
+        {
+            <li>@op</li>
+        }
+    </ul>
+}
+
+<form method="post">
+    <input type="hidden" asp-for="ReturnUrl" />
+    <button type="submit" asp-page-handler="Approve">Approve</button>
+    <button type="submit" asp-page-handler="Deny">Deny</button>
+</form>

@@ -1,7 +1,9 @@
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.RateLimiting;
 using Nordray.WhiteRabbit.AuthProxy;
 using Nordray.WhiteRabbit.Bunny;
+using Nordray.WhiteRabbit.Core.Services;
 using Nordray.WhiteRabbit.Infrastructure;
 using Nordray.WhiteRabbit.Infrastructure.Database;
 using Nordray.WhiteRabbit.Proxy;
@@ -19,27 +21,54 @@ builder.Configuration.AddEnvironmentVariables(prefix: "WhiteRabbit_");
 
 var configuration = builder.Configuration;
 
-// --- Infrastructure (DB, email, login codes) ---
+// --- Infrastructure (DB, email, login codes, grants) ---
 builder.Services.AddInfrastructure(configuration);
 
-// --- Bunny operation registry (singleton — the registry is immutable) ---
+// --- Bunny operation registry (singleton — immutable) ---
 builder.Services.AddSingleton<BunnyOperationRegistry>();
 
-// --- Authentication: cookie session for White Rabbit's own UI ---
-builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
-    .AddCookie(options =>
+// --- Capability seeder (scoped — uses IDbConnection) ---
+builder.Services.AddScoped<CapabilitySeeder>();
+
+// --- Authentication ---
+// Cookie for White Rabbit UI; JWT Bearer for OIDC clients calling the proxy.
+// A policy scheme selects the right handler based on the presence of Authorization header.
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultScheme = "SmartScheme";
+    options.DefaultChallengeScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+})
+.AddPolicyScheme("SmartScheme", "Cookie or Bearer", options =>
+{
+    options.ForwardDefaultSelector = ctx =>
+        ctx.Request.Headers.ContainsKey("Authorization")
+            ? JwtBearerDefaults.AuthenticationScheme
+            : CookieAuthenticationDefaults.AuthenticationScheme;
+})
+.AddCookie(CookieAuthenticationDefaults.AuthenticationScheme, options =>
+{
+    options.LoginPath = "/login";
+    options.Cookie.Name = "WhiteRabbit.Session";
+    options.Cookie.HttpOnly = true;
+    options.Cookie.SameSite = SameSiteMode.Lax;
+    options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+    options.ExpireTimeSpan = TimeSpan.FromHours(8);
+})
+.AddJwtBearer(JwtBearerDefaults.AuthenticationScheme, options =>
+{
+    // Dex is the token authority. White Rabbit proxies its well-known endpoints
+    // so the issuer URL is White Rabbit's own address in production.
+    options.Authority = configuration["Dex:IssuerUrl"];
+    options.RequireHttpsMetadata = false; // HTTPS enforced at the edge in production
+    options.TokenValidationParameters = new()
     {
-        options.LoginPath = "/login";
-        options.Cookie.Name = "WhiteRabbit.Session";
-        options.Cookie.HttpOnly = true;
-        options.Cookie.SameSite = SameSiteMode.Lax;
-        options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
-        options.ExpireTimeSpan = TimeSpan.FromHours(8);
-    });
+        ValidateAudience = false, // Audience varies per client; issuer + signature are sufficient
+    };
+});
 
 builder.Services.AddAuthorization();
 
-// --- Rate limiting (IP-based; per-email rate limiting is in LoginCodeService) ---
+// --- Rate limiting ---
 builder.Services.AddRateLimiter(opts =>
 {
     opts.AddFixedWindowLimiter("login", o =>
@@ -53,7 +82,6 @@ builder.Services.AddRateLimiter(opts =>
 });
 
 // --- YARP: hardcoded Dex proxy routes ---
-// The Dex cluster address is environment-specific; everything else is fixed.
 var dexAddress = configuration["Dex:InternalAddress"] ?? "http://dex:5556";
 
 var dexRoutes = new List<RouteConfig>
@@ -82,7 +110,6 @@ builder.Services.AddReverseProxy()
     .LoadFromMemory(dexRoutes, dexClusters)
     .AddTransforms(ctx =>
     {
-        // Inject the authenticated user's email as X-Remote-User before forwarding to Dex
         if (ctx.Route.RouteId == "dex-auth")
         {
             ctx.AddRequestTransform(transform =>
@@ -102,15 +129,19 @@ builder.Services.AddRazorPages();
 var app = builder.Build();
 // -----------------------------------------------------------------------
 
-// Ensure database schema exists before handling any requests
+// Ensure database schema exists and capabilities are seeded before serving requests
 await app.Services.GetRequiredService<DatabaseInitializer>().InitializeAsync();
+using (var scope = app.Services.CreateScope())
+{
+    await scope.ServiceProvider.GetRequiredService<CapabilitySeeder>().SeedAsync();
+}
 
 app.UseStaticFiles();
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseRateLimiter();
 
-// Dex authproxy middleware: intercepts /auth (but not /auth/email/* which are White Rabbit's own endpoints)
+// DexAuthProxyMiddleware intercepts /auth/* (but not /auth/email/* which are White Rabbit endpoints)
 app.UseWhen(
     ctx => ctx.Request.Path.StartsWithSegments("/auth", StringComparison.OrdinalIgnoreCase)
         && !ctx.Request.Path.StartsWithSegments("/auth/email", StringComparison.OrdinalIgnoreCase),
@@ -120,15 +151,14 @@ app.UseWhen(
 app.MapGet("/.well-known/health", () => Results.Ok(new { status = "healthy" }));
 app.MapGet("/.well-known/ready", (DatabaseInitializer _) => Results.Ok(new { status = "ready" }));
 
-// --- Razor Pages (login, consent, grants) ---
+// --- Razor Pages ---
 app.MapRazorPages();
 
-// --- Bunny API proxy: /proxy/api.bunny.net/{**path} ---
-// Requests are validated against BunnyOperationRegistry before being forwarded.
-// Unsupported paths → 404. Unauthenticated → 401. Missing capability → 403.
+// --- Bunny API proxy ---
 app.Map("/proxy/api.bunny.net/{**path}",
-    (HttpContext ctx, IHttpForwarder forwarder, BunnyOperationRegistry registry, IUserRepository users)
-        => BunnyForwarder.HandleAsync(ctx, forwarder, registry, users));
+    (HttpContext ctx, IHttpForwarder forwarder, BunnyOperationRegistry registry,
+     IUserRepository users, IGrantService grants)
+        => BunnyForwarder.HandleAsync(ctx, forwarder, registry, users, grants));
 
 // --- YARP (Dex proxy) ---
 app.MapReverseProxy();

@@ -2,6 +2,7 @@ using System.Security.Claims;
 using Microsoft.AspNetCore.Http;
 using Nordray.WhiteRabbit.Bunny;
 using Nordray.WhiteRabbit.Core;
+using Nordray.WhiteRabbit.Core.Services;
 using Nordray.WhiteRabbit.Infrastructure.Database;
 using Yarp.ReverseProxy.Forwarder;
 
@@ -9,8 +10,15 @@ namespace Nordray.WhiteRabbit.Proxy;
 
 /// <summary>
 /// Direct HTTP forwarder for validated bunny.net API requests.
-/// Mounted at /proxy/api.bunny.net/{**path} — requests are validated against the
-/// operation registry and the user's own bunny.net API key is injected per-request.
+/// Mounted at /proxy/api.bunny.net/{**path}.
+///
+/// Per-request flow:
+///   1. Look up operation in registry → 404 if not found
+///   2. Require authentication → 401 if missing
+///   3. Check capability grant for JWT clients → 403 if not granted
+///   4. Strip inbound credential headers
+///   5. Inject the user's own bunny.net API key
+///   6. Forward via IHttpForwarder, rewriting the path
 /// </summary>
 public static class BunnyForwarder
 {
@@ -26,7 +34,8 @@ public static class BunnyForwarder
         HttpContext ctx,
         IHttpForwarder forwarder,
         BunnyOperationRegistry registry,
-        IUserRepository users)
+        IUserRepository users,
+        IGrantService grants)
     {
         var pathSuffix = ctx.Request.RouteValues["path"] as string ?? "";
         var fullIncomingPath = "/proxy/api.bunny.net/" + pathSuffix;
@@ -44,21 +53,39 @@ public static class BunnyForwarder
             return;
         }
 
-        // TODO: capability check against grant table
+        var email = ctx.User.FindFirstValue(ClaimTypes.Email);
 
-        // Security boundary: strip any inbound credential or identity headers
+        // Capability check for JWT clients (azp = authorized party = the OIDC client_id).
+        // Cookie-authenticated users (direct browser access) are the account owners and
+        // bypass this check — they still need a valid API key below.
+        if (!op.RequiresAuthenticationOnly)
+        {
+            var clientId = ctx.User.FindFirstValue("azp");
+            if (clientId is not null && email is not null)
+            {
+                var granted = await grants.GetGrantedCapabilitiesAsync(email, clientId);
+                if (!granted.Contains(op.RequiredCapability!))
+                {
+                    ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+                    ctx.Response.ContentType = "application/json";
+                    await ctx.Response.WriteAsync(
+                        $$$"""{"error":"capability_not_granted","required":"{{{op.RequiredCapability}}}"}""");
+                    return;
+                }
+            }
+        }
+
+        // Security boundary: strip inbound credential and identity headers
         ctx.Request.Headers.Remove("AccessKey");
         ctx.Request.Headers.Remove("Authorization");
         ctx.Request.Headers.Remove("X-Remote-User");
         ctx.Request.Headers.Remove("X-Remote-Groups");
         ctx.Request.Headers.Remove("X-Remote-Extra");
 
-        // Inject the user's own bunny.net credential
+        // Inject the user's own bunny.net API key
         if (op.CredentialKind == BunnyCredentialKind.AccountApiKey)
         {
-            var email = ctx.User.FindFirstValue(ClaimTypes.Email);
             var user = email is not null ? await users.FindByEmailAsync(email) : null;
-
             if (string.IsNullOrEmpty(user?.BunnyApiKey))
             {
                 ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
@@ -82,9 +109,6 @@ public static class BunnyForwarder
             ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
     }
 
-    /// <summary>
-    /// Rewrites the outgoing URI from /proxy/api.bunny.net/{path} to https://api.bunny.net/{path}.
-    /// </summary>
     private sealed class PathRewriteTransformer(string pathSuffix) : HttpTransformer
     {
         public override async ValueTask TransformRequestAsync(
