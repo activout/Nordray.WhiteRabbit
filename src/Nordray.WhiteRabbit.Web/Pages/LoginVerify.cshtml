@@ -1,0 +1,24 @@
+@page
+@model LoginVerifyModel
+@{
+    ViewData["Title"] = "Enter your code";
+}
+
+<h1>Enter your code</h1>
+<p class="hint">We sent a 6-digit code to <strong>@Model.Email</strong>.</p>
+
+<form method="post">
+    <input type="hidden" asp-for="Email" />
+    <input type="hidden" asp-for="ReturnUrl" />
+    <div>
+        <label asp-for="Code">Login code</label>
+        <input asp-for="Code" type="text" inputmode="numeric" pattern="[0-9]{6}"
+               autocomplete="one-time-code" autofocus placeholder="000000" maxlength="6" required />
+    </div>
+    @if (Model.ErrorMessage is not null)
+    {
+        <p class="error">@Model.ErrorMessage</p>
+    }
+    <button type="submit">Verify</button>
+    <p class="hint"><a href="/login?returnUrl=@Uri.EscapeDataString(Model.ReturnUrl ?? "")">Send a new code</a></p>
+</form>

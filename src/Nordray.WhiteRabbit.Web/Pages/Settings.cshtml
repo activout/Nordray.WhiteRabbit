@@ -1,0 +1,42 @@
+@page
+@model SettingsModel
+@{
+    ViewData["Title"] = "Settings";
+}
+
+<h1>Settings</h1>
+
+<section>
+    <h2>bunny.net API key</h2>
+    <p>
+        Requests proxied to bunny.net use your own account API key.
+        Find it in the bunny.net portal under <strong>Account &rarr; API</strong>.
+    </p>
+
+    @if (Model.HasApiKey)
+    {
+        <p class="hint">A key is currently saved. Enter a new value below to replace it.</p>
+    }
+    else
+    {
+        <p class="hint">No key configured. Proxy requests will be rejected until you add one.</p>
+    }
+
+    <form method="post">
+        <div>
+            <label asp-for="ApiKey">bunny.net Account API key</label>
+            <input asp-for="ApiKey" type="password" autocomplete="off"
+                   placeholder="@(Model.HasApiKey ? "Enter new key to replace…" : "Paste your API key…")"
+                   required />
+        </div>
+        @if (Model.SuccessMessage is not null)
+        {
+            <p class="success">@Model.SuccessMessage</p>
+        }
+        @if (Model.ErrorMessage is not null)
+        {
+            <p class="error">@Model.ErrorMessage</p>
+        }
+        <button type="submit">Save key</button>
+    </form>
+</section>

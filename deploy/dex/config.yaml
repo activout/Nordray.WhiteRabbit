@@ -1,0 +1,46 @@
+# Dex configuration for local development.
+# White Rabbit acts as the authenticating proxy via the "authproxy" connector.
+# Dex does not handle login itself — it delegates to White Rabbit.
+
+# White Rabbit proxies all Dex endpoints — the issuer is White Rabbit's URL.
+# Clients use this URL for OIDC discovery and token operations.
+issuer: http://localhost:8080
+
+storage:
+  type: sqlite3
+  config:
+    file: /data/dex.db
+
+web:
+  http: 0.0.0.0:5556
+
+connectors:
+  - type: authproxy
+    id: white-rabbit-authproxy
+    name: White Rabbit
+    config:
+      # White Rabbit sets this header after successful email-code verification.
+      # Dex reads it to establish the user identity.
+      userHeader: X-Remote-User
+      # Optional: also forward groups or email via a header if needed later.
+
+oauth2:
+  # Only allow response_type=code (confidential clients only).
+  responseTypes:
+    - code
+  skipApprovalScreen: false
+
+staticClients:
+  - id: white-rabbit
+    secret: change-me-in-production
+    name: White Rabbit (local dev)
+    # White Rabbit itself is a client of Dex for its consent/session flow.
+    redirectURIs:
+      - http://localhost:8080/auth/callback
+
+  # Add your own test clients here during development. Example:
+  # - id: my-test-client
+  #   secret: test-secret
+  #   name: My Test Client
+  #   redirectURIs:
+  #     - http://localhost:3000/callback

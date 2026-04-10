@@ -1,0 +1,20 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+
+  <ItemGroup>
+    <PackageReference Include="Activout.DatabaseClient" Version="4.0.0" />
+    <PackageReference Include="Activout.DatabaseClient.Dapper" Version="4.0.0" />
+    <PackageReference Include="Mailjet.Api" Version="4.0.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.5" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.5" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.5" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.5" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.5" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Nordray.WhiteRabbit.Core\Nordray.WhiteRabbit.Core.csproj" />
+  </ItemGroup>
+
+</Project>

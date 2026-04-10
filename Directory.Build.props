@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- CS0612: obsolete without message; CS0618: obsolete with message — kept as warnings -->
+    <WarningsNotAsErrors>612;618</WarningsNotAsErrors>
+  </PropertyGroup>
+</Project>

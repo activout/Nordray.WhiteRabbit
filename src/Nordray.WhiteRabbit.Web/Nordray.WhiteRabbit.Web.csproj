@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+
+  <ItemGroup>
+    <PackageReference Include="Yarp.ReverseProxy" Version="2.3.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Nordray.WhiteRabbit.Core\Nordray.WhiteRabbit.Core.csproj" />
+    <ProjectReference Include="..\Nordray.WhiteRabbit.Bunny\Nordray.WhiteRabbit.Bunny.csproj" />
+    <ProjectReference Include="..\Nordray.WhiteRabbit.Infrastructure\Nordray.WhiteRabbit.Infrastructure.csproj" />
+    <ProjectReference Include="..\Nordray.WhiteRabbit.Proxy\Nordray.WhiteRabbit.Proxy.csproj" />
+    <ProjectReference Include="..\Nordray.WhiteRabbit.AuthProxy\Nordray.WhiteRabbit.AuthProxy.csproj" />
+  </ItemGroup>
+
+</Project>
