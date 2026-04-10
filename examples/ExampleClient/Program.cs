@@ -21,9 +21,9 @@ builder.Services.AddAuthentication(options =>
 .AddOpenIdConnect(options =>
 {
     // White Rabbit proxies all Dex OIDC endpoints — authority is White Rabbit's public URL.
-    options.Authority = configuration["WhiteRabbit:BaseUrl"];
-    options.ClientId = configuration["Oidc:ClientId"];
-    options.ClientSecret = configuration["Oidc:ClientSecret"];
+    options.Authority = configuration["WhiteRabbit:BaseUrl"] ?? throw new InvalidOperationException("Missing White Rabbit base URL configuration");
+    options.ClientId = configuration["Oidc:ClientId"] ?? throw new InvalidOperationException("Missing OIDC client ID configuration");
+    options.ClientSecret = configuration["Oidc:ClientSecret"] ?? throw new InvalidOperationException("Missing OIDC client secret configuration");
     options.ResponseType = "code";
     options.SaveTokens = true;               // stores access_token for proxy calls
     options.RequireHttpsMetadata = false;    // White Rabbit runs on HTTP in dev
@@ -78,12 +78,12 @@ app.UseAuthentication();
 app.UseAuthorization();
 app.MapRazorPages();
 
-// Trigger sign-out of both cookie and OIDC sessions.
+// Clear the local cookie session. Dex does not implement end_session_endpoint
+// so there is no OIDC back-channel sign-out to perform; the access token expires naturally.
 app.MapPost("/logout", async (HttpContext ctx) =>
 {
     await ctx.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
-    await ctx.SignOutAsync(OpenIdConnectDefaults.AuthenticationScheme,
-        new AuthenticationProperties { RedirectUri = "/signed-out" });
+    ctx.Response.Redirect("/signed-out");
 }).RequireAuthorization();
 
 app.Run();
