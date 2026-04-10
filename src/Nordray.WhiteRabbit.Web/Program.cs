@@ -250,9 +250,13 @@ app.MapReverseProxy(proxyPipeline =>
                 return;
             }
 
-            // 2. The proxy is only accessible via OIDC client tokens (azp claim required).
-            //    Cookie-session users are directed to use a registered OIDC client instead.
-            var clientId = ctx.User.FindFirstValue("azp");
+            // 2. The proxy is only accessible via OIDC client tokens.
+            //    Prefer azp (authorized party); fall back to aud (audience) which Dex
+            //    sets to the client_id when there is only one audience.
+            //    Cookie-session users have neither claim and are redirected to use a
+            //    registered OIDC client instead.
+            var clientId = ctx.User.FindFirstValue("azp")
+                        ?? ctx.User.FindFirstValue("aud");
             if (clientId is null)
             {
                 ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
