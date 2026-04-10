@@ -32,7 +32,7 @@ oauth2:
 
 staticClients:
   - id: white-rabbit
-    secret: change-me-in-production
+    secret: $DEX_WHITE_RABBIT_CLIENT_SECRET
     name: White Rabbit (local dev)
     # White Rabbit itself is a client of Dex for its consent/session flow.
     redirectURIs:
