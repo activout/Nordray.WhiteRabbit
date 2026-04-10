@@ -11,6 +11,7 @@ using Nordray.WhiteRabbit.Proxy;
 using System.Threading.RateLimiting;
 using Yarp.ReverseProxy.Configuration;
 using Yarp.ReverseProxy.Forwarder;
+using Yarp.ReverseProxy.Model;
 using Yarp.ReverseProxy.Transforms;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -25,11 +26,9 @@ var configuration = builder.Configuration;
 // --- Infrastructure (DB, email, login codes, grants) ---
 builder.Services.AddInfrastructure(configuration);
 
-// --- Bunny operation registry (singleton — immutable) ---
-builder.Services.AddSingleton<BunnyOperationRegistry>();
-
-// --- Bunny API forwarder (singleton — holds a shared HttpMessageInvoker and transformer) ---
-builder.Services.AddSingleton<BunnyForwarder>();
+// Create the registry before DI is built so we can use it to generate YARP routes.
+var bunnyRegistry = new BunnyOperationRegistry();
+builder.Services.AddSingleton(bunnyRegistry);
 
 // --- Capability seeder (scoped — uses IDbConnection) ---
 builder.Services.AddScoped<CapabilitySeeder>();
@@ -85,7 +84,8 @@ builder.Services.AddRateLimiter(opts =>
     opts.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 });
 
-// --- YARP: hardcoded Dex proxy routes ---
+// --- YARP routes and clusters ---
+
 var dexAddress = configuration["Dex:InternalAddress"] ?? "http://dex:5556";
 
 var dexRoutes = new List<RouteConfig>
@@ -98,25 +98,50 @@ var dexRoutes = new List<RouteConfig>
     new() { RouteId = "dex-callback",  ClusterId = "dex", Match = new RouteMatch { Path = "/callback/{**catch}" } },
 };
 
-var dexClusters = new List<ClusterConfig>
+// One YARP route per registered bunny operation. Metadata carries the capability
+// and credential requirements so the proxy pipeline can enforce them without
+// re-doing the registry lookup at request time.
+var bunnyRoutes = bunnyRegistry.GetAll().Select(op => new RouteConfig
 {
-    new()
+    RouteId = $"bunny.{op.OperationId}",
+    ClusterId = "bunny",
+    Match = new RouteMatch
     {
-        ClusterId = "dex",
-        Destinations = new Dictionary<string, DestinationConfig>
-        {
-            ["primary"] = new() { Address = dexAddress },
-        },
+        Path = op.IncomingPathTemplate,
+        Methods = [op.IncomingMethod],
+    },
+    Metadata = new Dictionary<string, string>
+    {
+        ["Capability"]   = op.RequiredCapability ?? "",
+        ["AuthOnly"]     = op.RequiresAuthenticationOnly ? "true" : "false",
+        ["CredentialKind"] = op.CredentialKind.ToString(),
+    },
+}).ToList();
+
+var dexCluster = new ClusterConfig
+{
+    ClusterId = "dex",
+    Destinations = new Dictionary<string, DestinationConfig>
+    {
+        ["primary"] = new() { Address = dexAddress },
+    },
+};
+
+var bunnyCluster = new ClusterConfig
+{
+    ClusterId = "bunny",
+    Destinations = new Dictionary<string, DestinationConfig>
+    {
+        ["primary"] = new() { Address = "https://api.bunny.net" },
     },
 };
 
 builder.Services.AddReverseProxy()
-    .LoadFromMemory(dexRoutes, dexClusters)
+    .LoadFromMemory([.. dexRoutes, .. bunnyRoutes], [dexCluster, bunnyCluster])
     .AddTransforms(ctx =>
     {
-        // The Dex authproxy connector requires X-Remote-User on every request it handles:
-        // - /auth/white-rabbit-authproxy  (DexAuthProxyMiddleware has run → email in Items)
-        // - /callback/white-rabbit-authproxy  (no middleware → read email from claims)
+        // Dex: inject X-Remote-User for the authproxy connector.
+        // The connector requires it on both /auth/* and /callback/* requests.
         if (ctx.Route.RouteId is "dex-auth" or "dex-callback")
         {
             ctx.AddRequestTransform(transform =>
@@ -128,7 +153,31 @@ builder.Services.AddReverseProxy()
                 return ValueTask.CompletedTask;
             });
         }
+
+        // Bunny: strip /proxy/api.bunny.net prefix, remove inbound credential and
+        // identity headers, set Host, and inject the user's AccessKey that the
+        // pipeline middleware stored in Items.
+        if (ctx.Route.RouteId.StartsWith("bunny.", StringComparison.Ordinal))
+        {
+            ctx.AddPathRemovePrefix("/proxy/api.bunny.net");
+            ctx.AddRequestHeaderRemove("AccessKey");
+            ctx.AddRequestHeaderRemove("Authorization");
+            ctx.AddRequestHeaderRemove("X-Remote-User");
+            ctx.AddRequestHeaderRemove("X-Remote-Groups");
+            ctx.AddRequestHeaderRemove("X-Remote-Extra");
+            ctx.AddRequestTransform(transform =>
+            {
+                transform.ProxyRequest.Headers.Host = "api.bunny.net";
+                if (transform.HttpContext.Items["bunny.access-key"] is string apiKey)
+                    transform.ProxyRequest.Headers.TryAddWithoutValidation("AccessKey", apiKey);
+                return ValueTask.CompletedTask;
+            });
+        }
     });
+
+// Replace the default YARP HTTP client factory so outbound bunny connections
+// are pinned to ISRG Root X1 (the certificate chain used by api.bunny.net).
+builder.Services.AddSingleton<IForwarderHttpClientFactory, BunnyHttpClientFactory>();
 
 // --- UI ---
 builder.Services.AddRazorPages();
@@ -162,13 +211,68 @@ app.MapGet("/.well-known/ready", (DatabaseInitializer _) => Results.Ok(new { sta
 // --- Razor Pages ---
 app.MapRazorPages();
 
-// --- Bunny API proxy ---
-app.Map("/proxy/api.bunny.net/{**path}",
-    (HttpContext ctx, IHttpForwarder forwarder, BunnyForwarder bunnyForwarder,
-     BunnyOperationRegistry registry, IUserRepository users, IGrantService grants)
-        => bunnyForwarder.HandleAsync(ctx, forwarder, registry, users, grants));
+// --- YARP (Dex + Bunny proxy) ---
+// The pipeline middleware enforces auth, capability grants, and credential injection
+// for bunny routes before YARP forwards the request.
+app.MapReverseProxy(proxyPipeline =>
+{
+    proxyPipeline.Use(async (ctx, next) =>
+    {
+        var route = ctx.Features.Get<IReverseProxyFeature>()?.Route;
+        if (route?.Config.RouteId.StartsWith("bunny.", StringComparison.Ordinal) == true)
+        {
+            var metadata = route.Config.Metadata!;
 
-// --- YARP (Dex proxy) ---
-app.MapReverseProxy();
+            // 1. Require authentication
+            if (ctx.User.Identity?.IsAuthenticated != true)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                return;
+            }
+
+            var email = ctx.User.FindFirstValue(ClaimTypes.Email);
+
+            // 2. Capability check for JWT clients (azp claim = OIDC client_id).
+            //    Cookie-authenticated users own the account and skip this check.
+            if (metadata["AuthOnly"] != "true")
+            {
+                var clientId = ctx.User.FindFirstValue("azp");
+                if (clientId is not null && email is not null)
+                {
+                    var capability = metadata["Capability"];
+                    var grants = ctx.RequestServices.GetRequiredService<IGrantService>();
+                    var granted = await grants.GetGrantedCapabilitiesAsync(email, clientId);
+                    if (!granted.Contains(capability))
+                    {
+                        ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+                        ctx.Response.ContentType = "application/json";
+                        await ctx.Response.WriteAsync(
+                            $$"""{"error":"capability_not_granted","required":"{{capability}}"}""");
+                        return;
+                    }
+                }
+            }
+
+            // 3. Inject the user's own bunny.net API key via Items so the transform
+            //    can add it to the proxy request after header copying.
+            if (metadata["CredentialKind"] == "AccountApiKey")
+            {
+                var users = ctx.RequestServices.GetRequiredService<IUserRepository>();
+                var user = email is not null ? await users.FindByEmailAsync(email) : null;
+                if (string.IsNullOrEmpty(user?.BunnyApiKey))
+                {
+                    ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+                    ctx.Response.ContentType = "application/json";
+                    await ctx.Response.WriteAsync(
+                        """{"error":"bunny_api_key_not_configured","detail":"Go to /settings to add your bunny.net API key."}""");
+                    return;
+                }
+                ctx.Items["bunny.access-key"] = user.BunnyApiKey;
+            }
+        }
+
+        await next();
+    });
+});
 
 app.Run();

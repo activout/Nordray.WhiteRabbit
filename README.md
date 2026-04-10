@@ -68,7 +68,7 @@ New endpoints require a code review and an explicit entry in `BunnyOperationRegi
 |---|---|
 | Web host | ASP.NET Core 10 |
 | OIDC provider | [Dex](https://dexidp.io) (authproxy connector) |
-| Proxy forwarding | YARP / `IHttpForwarder` |
+| Proxy forwarding | YARP (reverse proxy pipeline) |
 | Database | SQLite via [Activout.DatabaseClient](https://github.com/activout/Activout.DatabaseClient) |
 | Email | Mailjet (SMTP/Mailpit fallback for local dev) |
 | Tests | xUnit, RichardSzalay.MockHttp |
@@ -88,7 +88,7 @@ export WhiteRabbit_Dex__ClientSecret=change-me-in-production
 dotnet watch --project src/Nordray.WhiteRabbit.Web
 ```
 
-Open [http://localhost:5000](http://localhost:5000) and sign in with your email. Check [http://localhost:8025](http://localhost:8025) (Mailpit) for the login code.
+Open [http://localhost:8080](http://localhost:8080) and sign in with your email. Check [http://localhost:8025](http://localhost:8025) (Mailpit) for the login code.
 
 To run everything in Docker:
 
@@ -126,7 +126,7 @@ src/
   Nordray.WhiteRabbit.Web            ASP.NET Core host, Razor pages, middleware pipeline
   Nordray.WhiteRabbit.Core           Domain types — BunnyOperation, capabilities, models
   Nordray.WhiteRabbit.Infrastructure SQLite repositories, Mailjet/SMTP email service
-  Nordray.WhiteRabbit.Proxy          IHttpForwarder handler, credential injection
+  Nordray.WhiteRabbit.Proxy          BunnyHttpClientFactory, ISRG Root X1 certificate pinning
   Nordray.WhiteRabbit.Bunny          BunnyOperationRegistry (the hard-coded allow-list)
   Nordray.WhiteRabbit.AuthProxy      DexAuthProxyMiddleware, X-Remote-User injection
 tests/
@@ -134,6 +134,8 @@ tests/
   Nordray.WhiteRabbit.Tests.Integration
 deploy/
   dex/config.yaml                    Dex configuration (authproxy connector)
+examples/
+  ExampleClient                      Sample OIDC client demonstrating the full login + proxy flow
 ```
 
 ## What v1 deliberately does not include
