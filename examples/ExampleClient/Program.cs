@@ -26,7 +26,7 @@ builder.Services.AddAuthentication(options =>
     options.ClientSecret = configuration["Oidc:ClientSecret"] ?? throw new InvalidOperationException("Missing OIDC client secret configuration");
     options.ResponseType = "code";
     options.SaveTokens = true;               // stores access_token for proxy calls
-    options.RequireHttpsMetadata = false;    // White Rabbit runs on HTTP in dev
+    options.RequireHttpsMetadata = !builder.Environment.IsDevelopment();
     options.GetClaimsFromUserInfoEndpoint = true;
 
     // Request the capabilities this client needs.
