@@ -28,7 +28,9 @@ oauth2:
   # Only allow response_type=code (confidential clients only).
   responseTypes:
     - code
-  skipApprovalScreen: false
+  # White Rabbit handles consent before the request reaches Dex, so Dex's
+  # own approval screen is never needed and would 404 (not proxied).
+  skipApprovalScreen: true
 
 staticClients:
   - id: white-rabbit
