@@ -22,12 +22,28 @@ services:
       - dex
       - mailpit
 
+  example-client:
+    build:
+      context: examples/ExampleClient
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      - ASPNETCORE_URLS=http://+:8081
+      - WhiteRabbit__BaseUrl=http://localhost:8080
+      - WhiteRabbit__ProxyBaseUrl=http://white-rabbit:8080
+      - Oidc__ClientId=example-client
+      - Oidc__ClientSecret=${DEX_EXAMPLE_CLIENT_SECRET:?DEX_EXAMPLE_CLIENT_SECRET must be set}
+    depends_on:
+      - white-rabbit
+
   dex:
     image: dexidp/dex:v2.41.1
     ports:
       - "5556:5556"
     environment:
       - DEX_WHITE_RABBIT_CLIENT_SECRET=${DEX_WHITE_RABBIT_CLIENT_SECRET:?DEX_WHITE_RABBIT_CLIENT_SECRET must be set}
+      - DEX_EXAMPLE_CLIENT_SECRET=${DEX_EXAMPLE_CLIENT_SECRET:?DEX_EXAMPLE_CLIENT_SECRET must be set}
     volumes:
       - ./deploy/dex/config.yaml:/etc/dex/config.yaml:ro
       - ./data/dex:/data

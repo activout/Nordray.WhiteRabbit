@@ -1,0 +1,24 @@
+@page
+@model IndexModel
+@{
+    ViewData["Title"] = "Home";
+}
+
+<h1>White Rabbit Example Client</h1>
+
+@if (Model.IsAuthenticated)
+{
+    <p>Signed in as <strong>@Model.Email</strong>.</p>
+    <p><a href="/pull-zones" class="btn">View Pull Zones</a></p>
+}
+else
+{
+    <p>This example demonstrates an OIDC client application connecting through White Rabbit to access bunny.net APIs.</p>
+    <ul>
+        <li>Authenticates users via White Rabbit + Dex (email login code)</li>
+        <li>Requests <code>pullzone.read</code> and <code>statistics.read</code> capabilities</li>
+        <li>White Rabbit shows a consent screen on first access</li>
+        <li>Calls the White Rabbit proxy with the OIDC access token</li>
+    </ul>
+    <p><a href="/pull-zones" class="btn">Sign in and view Pull Zones</a></p>
+}

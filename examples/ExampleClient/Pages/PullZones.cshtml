@@ -1,0 +1,55 @@
+@page
+@model PullZonesModel
+@{
+    ViewData["Title"] = "Pull Zones";
+}
+
+<h1>Pull Zones</h1>
+
+@if (Model.Error is not null)
+{
+    <div class="error">
+        <strong>Error @((int)Model.Error.StatusCode):</strong> @Model.Error.Message
+    </div>
+}
+else if (Model.PullZones is not null)
+{
+    <p>Fetched via <code>GET /proxy/api.bunny.net/pullzone</code> using your OIDC access token.</p>
+
+    @if (Model.PullZones.Count == 0)
+    {
+        <p>No pull zones found on this account.</p>
+    }
+    else
+    {
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Name</th>
+                    <th>Enabled Hostnames</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var zone in Model.PullZones)
+                {
+                    <tr>
+                        <td>@zone.Id</td>
+                        <td>@zone.Name</td>
+                        <td>
+                            @foreach (var h in zone.Hostnames ?? [])
+                            {
+                                <span class="badge">@h</span>
+                            }
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+
+    <details style="margin-top: 2rem;">
+        <summary style="cursor: pointer; color: #555;">Access token (for debugging)</summary>
+        <pre>@Model.AccessToken</pre>
+    </details>
+}

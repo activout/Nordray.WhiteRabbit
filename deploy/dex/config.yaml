@@ -38,9 +38,9 @@ staticClients:
     redirectURIs:
       - http://localhost:8080/auth/callback
 
-  # Add your own test clients here during development. Example:
-  # - id: my-test-client
-  #   secret: test-secret
-  #   name: My Test Client
-  #   redirectURIs:
-  #     - http://localhost:3000/callback
+  - id: example-client
+    secret: $DEX_EXAMPLE_CLIENT_SECRET
+    name: White Rabbit Example Client
+    redirectURIs:
+      - http://localhost:8081/signin-oidc
+      - http://localhost:8081/signout-callback-oidc
