@@ -8,17 +8,14 @@ services:
     environment:
       - ASPNETCORE_ENVIRONMENT=Development
       - ASPNETCORE_URLS=http://+:8080
-      - Database__ConnectionString=Data Source=/data/white-rabbit.db
-      - Dex__IssuerUrl=http://dex:5556
-      - Dex__ClientId=white-rabbit
-      - Dex__ClientSecret=change-me-in-production
-      - Mailjet__ApiKey=${MAILJET_API_KEY:-}
-      - Mailjet__SecretKey=${MAILJET_SECRET_KEY:-}
-      - Mailjet__FromEmail=${MAILJET_FROM_EMAIL:-noreply@example.com}
-      # Override with real credentials for production:
-      # - WHITE_RABBIT_BUNNY_ACCOUNT_API_KEY=...
-      # - WHITE_RABBIT_BUNNY_STREAM_API_KEY=...
-      # - WHITE_RABBIT_BUNNY_STORAGE_PASSWORD=...
+      - WhiteRabbit_Database__ConnectionString=Data Source=/data/white-rabbit.db
+      - WhiteRabbit_Dex__IssuerUrl=http://white-rabbit:8080
+      - WhiteRabbit_Dex__InternalAddress=http://dex:5556
+      - WhiteRabbit_Dex__ClientId=white-rabbit
+      - WhiteRabbit_Dex__ClientSecret=change-me-in-production
+      - WhiteRabbit_Mailjet__ApiKey=${MAILJET_API_KEY:-}
+      - WhiteRabbit_Mailjet__SecretKey=${MAILJET_SECRET_KEY:-}
+      - WhiteRabbit_Mailjet__FromEmail=${MAILJET_FROM_EMAIL:-noreply@example.com}
     volumes:
       - ./data/white-rabbit:/data
     depends_on:

@@ -5,7 +5,8 @@ obj/
 # Local data (SQLite databases, Dex state)
 data/
 
-# User secrets and local overrides
+# Secrets — never commit real values
+.env
 appsettings.Local.json
 *.user
 

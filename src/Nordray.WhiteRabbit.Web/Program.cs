@@ -11,6 +11,12 @@ using Yarp.ReverseProxy.Forwarder;
 using Yarp.ReverseProxy.Transforms;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Secrets are never stored in appsettings files. All sensitive values must be
+// supplied as WhiteRabbit_* environment variables (__ maps to : in config hierarchy).
+// Example: WhiteRabbit_Mailjet__ApiKey=xxx  →  Mailjet:ApiKey
+builder.Configuration.AddEnvironmentVariables(prefix: "WhiteRabbit_");
+
 var configuration = builder.Configuration;
 
 // --- Infrastructure (DB, email, login codes) ---

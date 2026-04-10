@@ -270,45 +270,43 @@ GET  /.well-known/ready
 
 ## Configuration
 
-Configuration sources (in order of precedence): environment variables > `appsettings.{Environment}.json` > `appsettings.json`.
+### Secret handling rules
 
-### Required environment variables
+**Secrets are never stored in `appsettings*.json` files.** All sensitive values must be
+supplied as environment variables with the `WhiteRabbit_` prefix. The prefix is stripped
+and `__` maps to `:` in the config hierarchy:
 
 ```
-WHITE_RABBIT_BUNNY_ACCOUNT_API_KEY
-WHITE_RABBIT_BUNNY_STREAM_API_KEY
-WHITE_RABBIT_BUNNY_STORAGE_PASSWORD
+WhiteRabbit_Mailjet__ApiKey=xxx   →   Mailjet:ApiKey
+WhiteRabbit_Dex__ClientSecret=xxx →   Dex:ClientSecret
 ```
 
-### Required appsettings sections
+`Program.cs` calls `builder.Configuration.AddEnvironmentVariables(prefix: "WhiteRabbit_")`
+which loads these after `appsettings.json`, so they always win. Standard ASP.NET Core
+variables (`ASPNETCORE_ENVIRONMENT`, `ASPNETCORE_URLS`) keep their normal unprefixed names.
+
+For local development copy `.env.example` → `.env` (git-ignored) and fill in values.
+Docker Compose reads `.env` automatically. When running with `dotnet watch` outside Docker,
+export the variables in your shell or use a tool like `dotenv`.
+
+### Secret environment variables
+
+| Variable | Config key | Purpose |
+|---|---|---|
+| `WhiteRabbit_Dex__ClientSecret` | `Dex:ClientSecret` | Shared secret between White Rabbit and Dex |
+| `WhiteRabbit_Mailjet__ApiKey` | `Mailjet:ApiKey` | Mailjet API key (omit to fall back to SMTP) |
+| `WhiteRabbit_Mailjet__SecretKey` | `Mailjet:SecretKey` | Mailjet secret key |
+| `WhiteRabbit_Mailjet__FromEmail` | `Mailjet:FromEmail` | Sender address |
+
+### Non-secret appsettings (safe to commit)
 
 ```json
 {
-  "Dex": {
-    "IssuerUrl": "",
-    "ClientId": "",
-    "ClientSecret": ""
-  },
-  "Mailjet": {
-    "ApiKey": "",
-    "SecretKey": "",
-    "FromEmail": "",
-    "FromName": ""
-  },
-  "Database": {
-    "ConnectionString": "Data Source=./data/white-rabbit.db"
-  },
-  "LoginCode": {
-    "ExpiryMinutes": 10,
-    "ResendCooldownSeconds": 60
-  },
-  "RateLimit": {
-    "RequestsPerEmailPerHour": 5,
-    "RequestsPerIpPerHour": 20
-  },
-  "Bunny": {
-    "BaseUrl": "https://api.bunny.net"
-  }
+  "Dex": { "InternalAddress": "http://dex:5556", "IssuerUrl": "", "ClientId": "white-rabbit" },
+  "Mailjet": { "FromName": "White Rabbit", "SmtpHost": "", "SmtpPort": 1025 },
+  "Database": { "ConnectionString": "Data Source=./data/white-rabbit.db" },
+  "LoginCode": { "ExpiryMinutes": 10, "ResendCooldownSeconds": 60 },
+  "RateLimit": { "RequestsPerEmailPerHour": 5, "RequestsPerIpPerHour": 20 }
 }
 ```
 
