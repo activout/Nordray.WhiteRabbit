@@ -1,4 +1,7 @@
+using System.Net.Security;
+using System.Reflection;
 using System.Security.Claims;
+using System.Security.Cryptography.X509Certificates;
 using Microsoft.AspNetCore.Http;
 using Nordray.WhiteRabbit.Bunny;
 using Nordray.WhiteRabbit.Core;
@@ -22,13 +25,44 @@ namespace Nordray.WhiteRabbit.Proxy;
 /// </summary>
 public static class BunnyForwarder
 {
+    // Trust only ISRG Root X1 for outbound connections to api.bunny.net.
+    // This rejects any intercepting proxy that presents its own CA certificate.
+    private static readonly X509Certificate2 IsrgRootX1 = LoadIsrgRootX1();
+
     private static readonly HttpMessageInvoker HttpClient = new(new SocketsHttpHandler
     {
         UseProxy = false,
         AllowAutoRedirect = false,
         UseCookies = false,
         ConnectTimeout = TimeSpan.FromSeconds(15),
+        SslOptions = new SslClientAuthenticationOptions
+        {
+            RemoteCertificateValidationCallback = ValidateAgainstIsrgRootX1,
+        },
     });
+
+    private static X509Certificate2 LoadIsrgRootX1()
+    {
+        var asm = Assembly.GetExecutingAssembly();
+        var resourceName = asm.GetManifestResourceNames()
+            .Single(n => n.EndsWith("isrg-root-x1.pem", StringComparison.Ordinal));
+        using var stream = asm.GetManifestResourceStream(resourceName)!;
+        using var reader = new StreamReader(stream);
+        var pem = reader.ReadToEnd();
+        return X509Certificate2.CreateFromPem(pem);
+    }
+
+    private static bool ValidateAgainstIsrgRootX1(
+        object? sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors errors)
+    {
+        if (certificate is not X509Certificate2 cert) return false;
+
+        using var customChain = new X509Chain();
+        customChain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+        customChain.ChainPolicy.CustomTrustStore.Add(IsrgRootX1);
+        customChain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+        return customChain.Build(cert);
+    }
 
     public static async Task HandleAsync(
         HttpContext ctx,
