@@ -1,6 +1,4 @@
-using System.Net;
 using System.Net.Security;
-using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Claims;
 using System.Security.Cryptography.X509Certificates;
@@ -10,6 +8,8 @@ using Nordray.WhiteRabbit.Core;
 using Nordray.WhiteRabbit.Core.Services;
 using Nordray.WhiteRabbit.Infrastructure.Database;
 using Yarp.ReverseProxy.Forwarder;
+using Yarp.ReverseProxy.Transforms;
+using Yarp.ReverseProxy.Transforms.Builder;
 
 namespace Nordray.WhiteRabbit.Proxy;
 
@@ -25,10 +25,9 @@ namespace Nordray.WhiteRabbit.Proxy;
 ///   5. Inject the user's own bunny.net API key
 ///   6. Forward via IHttpForwarder, rewriting the path
 /// </summary>
-public static class BunnyForwarder
+public sealed class BunnyForwarder
 {
-    // Trust only ISRG Root X1 for outbound connections to api.bunny.net.
-    // This rejects any intercepting proxy that presents its own CA certificate.
+    // Trust only ISRG Root X1 (Let's Encrypt) for outbound connections to api.bunny.net.
     private static readonly X509Certificate2 IsrgRootX1 = LoadIsrgRootX1();
 
     private static readonly HttpMessageInvoker HttpClient = new(new SocketsHttpHandler
@@ -37,48 +36,32 @@ public static class BunnyForwarder
         AllowAutoRedirect = false,
         UseCookies = false,
         ConnectTimeout = TimeSpan.FromSeconds(15),
-        // Explicit ConnectCallback gives direct control over SNI and certificate validation.
-        // Without this, SocketsHttpHandler may derive SNI from a Host header that YARP has
-        // already overwritten with the inbound request's host (localhost:8080).
-        ConnectCallback = async (context, cancellationToken) =>
+        SslOptions = new SslClientAuthenticationOptions
         {
-            var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-            await socket.ConnectAsync(context.DnsEndPoint, cancellationToken);
-            var sslStream = new SslStream(new NetworkStream(socket, ownsSocket: true));
-            await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
-            {
-                TargetHost = "api.bunny.net",   // explicit SNI — never inherits from Host header
-                ApplicationProtocols = [SslApplicationProtocol.Http2, SslApplicationProtocol.Http11],
-                RemoteCertificateValidationCallback = ValidateAgainstIsrgRootX1,
-            }, cancellationToken);
-            return sslStream;
+            RemoteCertificateValidationCallback = ValidateAgainstIsrgRootX1,
         },
     });
 
-    private static X509Certificate2 LoadIsrgRootX1()
+    private readonly HttpTransformer _transformer;
+
+    public BunnyForwarder(ITransformBuilder transformBuilder)
     {
-        var asm = Assembly.GetExecutingAssembly();
-        var resourceName = asm.GetManifestResourceNames()
-            .Single(n => n.EndsWith("isrg-root-x1.pem", StringComparison.Ordinal));
-        using var stream = asm.GetManifestResourceStream(resourceName)!;
-        using var reader = new StreamReader(stream);
-        var pem = reader.ReadToEnd();
-        return X509Certificate2.CreateFromPem(pem);
+        _transformer = transformBuilder.Create(ctx =>
+        {
+            // Rewrite path and host. YARP would otherwise forward the inbound path
+            // (/proxy/api.bunny.net/pullzone) and Host (localhost:8080) verbatim.
+            ctx.AddRequestTransform(transformCtx =>
+            {
+                var pathSuffix = transformCtx.HttpContext.Request.RouteValues["path"] as string ?? "";
+                var query = transformCtx.HttpContext.Request.QueryString.Value ?? "";
+                transformCtx.ProxyRequest.RequestUri = new Uri($"https://api.bunny.net/{pathSuffix}{query}");
+                transformCtx.ProxyRequest.Headers.Host = "api.bunny.net";
+                return ValueTask.CompletedTask;
+            });
+        });
     }
 
-    private static bool ValidateAgainstIsrgRootX1(
-        object? sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors errors)
-    {
-        if (certificate is not X509Certificate2 cert) return false;
-
-        using var customChain = new X509Chain();
-        customChain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
-        customChain.ChainPolicy.CustomTrustStore.Add(IsrgRootX1);
-        customChain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-        return customChain.Build(cert);
-    }
-
-    public static async Task HandleAsync(
+    public async Task HandleAsync(
         HttpContext ctx,
         IHttpForwarder forwarder,
         BunnyOperationRegistry registry,
@@ -151,26 +134,31 @@ public static class BunnyForwarder
             "https://api.bunny.net",
             HttpClient,
             ForwarderRequestConfig.Empty,
-            new PathRewriteTransformer(pathSuffix));
+            _transformer);
 
         if (error != ForwarderError.None && !ctx.Response.HasStarted)
             ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
     }
 
-    private sealed class PathRewriteTransformer(string pathSuffix) : HttpTransformer
+    private static X509Certificate2 LoadIsrgRootX1()
     {
-        public override async ValueTask TransformRequestAsync(
-            HttpContext httpContext,
-            HttpRequestMessage proxyRequest,
-            string destinationPrefix,
-            CancellationToken cancellationToken)
-        {
-            await base.TransformRequestAsync(httpContext, proxyRequest, destinationPrefix, cancellationToken);
-            var query = httpContext.Request.QueryString.Value ?? "";
-            proxyRequest.RequestUri = new Uri($"https://api.bunny.net/{pathSuffix}{query}");
-            // Explicitly set Host so bunny.net receives the correct value regardless of
-            // what YARP copied from the inbound request (which would be localhost:8080).
-            proxyRequest.Headers.Host = "api.bunny.net";
-        }
+        var asm = Assembly.GetExecutingAssembly();
+        var resourceName = asm.GetManifestResourceNames()
+            .Single(n => n.EndsWith("isrg-root-x1.pem", StringComparison.Ordinal));
+        using var stream = asm.GetManifestResourceStream(resourceName)!;
+        using var reader = new StreamReader(stream);
+        return X509Certificate2.CreateFromPem(reader.ReadToEnd());
+    }
+
+    private static bool ValidateAgainstIsrgRootX1(
+        object? sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors errors)
+    {
+        if (certificate is not X509Certificate2 cert) return false;
+
+        using var customChain = new X509Chain();
+        customChain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+        customChain.ChainPolicy.CustomTrustStore.Add(IsrgRootX1);
+        customChain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+        return customChain.Build(cert);
     }
 }

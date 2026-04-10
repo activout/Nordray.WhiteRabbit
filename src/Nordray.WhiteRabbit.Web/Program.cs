@@ -28,6 +28,9 @@ builder.Services.AddInfrastructure(configuration);
 // --- Bunny operation registry (singleton — immutable) ---
 builder.Services.AddSingleton<BunnyOperationRegistry>();
 
+// --- Bunny API forwarder (singleton — holds a shared HttpMessageInvoker and transformer) ---
+builder.Services.AddSingleton<BunnyForwarder>();
+
 // --- Capability seeder (scoped — uses IDbConnection) ---
 builder.Services.AddScoped<CapabilitySeeder>();
 
@@ -161,9 +164,9 @@ app.MapRazorPages();
 
 // --- Bunny API proxy ---
 app.Map("/proxy/api.bunny.net/{**path}",
-    (HttpContext ctx, IHttpForwarder forwarder, BunnyOperationRegistry registry,
-     IUserRepository users, IGrantService grants)
-        => BunnyForwarder.HandleAsync(ctx, forwarder, registry, users, grants));
+    (HttpContext ctx, IHttpForwarder forwarder, BunnyForwarder bunnyForwarder,
+     BunnyOperationRegistry registry, IUserRepository users, IGrantService grants)
+        => bunnyForwarder.HandleAsync(ctx, forwarder, registry, users, grants));
 
 // --- YARP (Dex proxy) ---
 app.MapReverseProxy();
