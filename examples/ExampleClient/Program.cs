@@ -39,6 +39,23 @@ builder.Services.AddAuthentication(options =>
     options.Scope.Add("statistics.read");
 
     options.SignedOutRedirectUri = "/signed-out";
+
+    options.Events.OnRemoteFailure = ctx =>
+    {
+        // User clicked "Deny" on the consent screen — redirect home with a message
+        // rather than letting the exception bubble up as a 500.
+        if (ctx.Failure?.Message.Contains("access_denied") == true)
+        {
+            ctx.Response.Redirect("/?denied=1");
+            ctx.HandleResponse();
+            return Task.CompletedTask;
+        }
+
+        // Any other OIDC error: redirect home with a generic message.
+        ctx.Response.Redirect("/?error=1");
+        ctx.HandleResponse();
+        return Task.CompletedTask;
+    };
 });
 
 builder.Services.AddAuthorization();

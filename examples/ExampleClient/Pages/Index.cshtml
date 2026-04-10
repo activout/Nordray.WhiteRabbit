@@ -6,6 +6,21 @@
 
 <h1>White Rabbit Example Client</h1>
 
+@if (Model.AccessDenied)
+{
+    <div class="error">
+        <strong>Access denied.</strong> You declined the consent request.
+        The example client needs <code>pullzone.read</code> and <code>statistics.read</code>
+        to function. <a href="/pull-zones">Try again</a> and approve when prompted.
+    </div>
+}
+else if (Model.Error)
+{
+    <div class="error">
+        <strong>Sign-in failed.</strong> An error occurred during authentication. Please try again.
+    </div>
+}
+
 @if (Model.IsAuthenticated)
 {
     <p>Signed in as <strong>@Model.Email</strong>.</p>
