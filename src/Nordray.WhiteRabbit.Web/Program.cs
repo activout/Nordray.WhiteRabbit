@@ -1,14 +1,21 @@
+using System.Data.Common;
 using System.Security.Claims;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.DataProtection.KeyManagement;
 using Microsoft.AspNetCore.RateLimiting;
 using Nordray.WhiteRabbit.AuthProxy;
 using Nordray.WhiteRabbit.Bunny;
+using Nordray.WhiteRabbit.Core.Access;
 using Nordray.WhiteRabbit.Core.Services;
 using Nordray.WhiteRabbit.Infrastructure;
 using Nordray.WhiteRabbit.Infrastructure.Database;
+using Nordray.WhiteRabbit.Infrastructure.Encryption;
 using Nordray.WhiteRabbit.Proxy;
+using Nordray.WhiteRabbit.Web;
+using Nordray.WhiteRabbit.Web.DataProtection;
 using System.Threading.RateLimiting;
 using Yarp.ReverseProxy.Configuration;
 using Yarp.ReverseProxy.Forwarder;
@@ -31,8 +38,26 @@ builder.Services.AddInfrastructure(configuration);
 var bunnyRegistry = new BunnyOperationRegistry();
 builder.Services.AddSingleton(bunnyRegistry);
 
-// --- Capability seeder (scoped — uses IDbConnection) ---
+// --- Capability seeder (scoped — uses the request-scoped connection) ---
 builder.Services.AddScoped<CapabilitySeeder>();
+
+// --- Data Protection ---
+// The key ring protects the stored Bunny API keys, so it lives in the database (encrypted with
+// DataProtection:EncryptionKey) instead of the container's file system, which is lost on replacement.
+// The application name is fixed so keys stay valid when the content root or container path changes.
+builder.Services.AddDataProtection().SetApplicationName("Nordray.WhiteRabbit");
+builder.Services.AddOptions<KeyManagementOptions>().Configure<IServiceProvider>((keys, services) =>
+{
+    keys.XmlRepository = new DatabaseKeyRing(services);
+    keys.XmlEncryptor = new KeyRingEncryptor(services.GetRequiredService<KeyRingEncryption>());
+});
+
+// --- Proxy clients ---
+// OIDC client IDs whose Dex tokens the Bunny proxy accepts. Empty means none: tokens must name an
+// explicitly configured audience.
+var proxyClients = new ProxyClientOptions(
+    configuration.GetSection("Proxy:AllowedClientIds").Get<string[]>() ?? []);
+builder.Services.AddSingleton(proxyClients);
 
 // --- Authentication ---
 // Cookie for White Rabbit UI; JWT Bearer for OIDC clients calling the proxy.
@@ -57,6 +82,16 @@ builder.Services.AddAuthentication(options =>
     options.Cookie.SameSite = SameSiteMode.Strict;
     options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
     options.ExpireTimeSpan = TimeSpan.FromHours(8);
+    // Removing an address from the sign-in allow-list ends its existing sessions on their next request.
+    options.Events.OnValidatePrincipal = async ctx =>
+    {
+        var policy = ctx.HttpContext.RequestServices.GetRequiredService<SignInPolicy>();
+        if (!policy.IsAllowed(ctx.Principal?.FindFirstValue(ClaimTypes.Email)))
+        {
+            ctx.RejectPrincipal();
+            await ctx.HttpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+        }
+    };
 })
 .AddJwtBearer(JwtBearerDefaults.AuthenticationScheme, options =>
 {
@@ -66,7 +101,13 @@ builder.Services.AddAuthentication(options =>
     options.RequireHttpsMetadata = !builder.Environment.IsDevelopment();
     options.TokenValidationParameters = new()
     {
-        ValidateAudience = false, // Audience varies per client; issuer + signature are sufficient
+        // The token must be issued to one of the configured proxy clients. Issuer and signature come from
+        // the Authority's metadata; GitHub, Forgejo or other-environment tokens fail on issuer or signature.
+        ValidateAudience = true,
+        ValidateIssuer = true,
+        ValidateLifetime = true,
+        RequireExpirationTime = true,
+        AudienceValidator = (audiences, _, _) => audiences.Any(proxyClients.AllowedClientIds.Contains),
     };
 });
 
@@ -197,6 +238,15 @@ builder.Services.AddRazorPages();
 var app = builder.Build();
 // -----------------------------------------------------------------------
 
+// Fail fast on a missing or malformed DataProtection:EncryptionKey, before anything is written.
+app.Services.GetRequiredService<KeyRingEncryption>();
+
+var signInPolicy = app.Services.GetRequiredService<SignInPolicy>();
+if (!signInPolicy.AllowsAnyone)
+    app.Logger.LogWarning("Access:AllowedEmails and Access:AllowedDomains are empty: nobody can sign in.");
+if (proxyClients.AllowedClientIds.Count == 0)
+    app.Logger.LogWarning("Proxy:AllowedClientIds is empty: the Bunny proxy accepts no bearer tokens.");
+
 // Create a named data protector for encrypting/decrypting stored bunny API keys.
 // The purpose string is versioned so it can be rotated in the future.
 var bunnyKeyProtector = app.Services
@@ -222,8 +272,24 @@ app.UseWhen(
     branch => branch.UseMiddleware<DexAuthProxyMiddleware>());
 
 // --- Health endpoints ---
-app.MapGet("/.well-known/health", () => Results.Ok(new { status = "healthy" }));
-app.MapGet("/.well-known/ready", (DatabaseInitializer _) => Results.Ok(new { status = "ready" }));
+// /health: the process is running. /ready: the database answers and every shipped migration is applied.
+// Neither exposes connection details or exception messages.
+app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
+app.MapGet("/ready", async (DbConnection connection, ILogger<DatabaseMigrator> logger, CancellationToken ct) =>
+{
+    try
+    {
+        var pending = await new DatabaseMigrator(connection, logger).PendingVersionsAsync(ct);
+        return pending.Count == 0
+            ? Results.Ok(new { status = "ready" })
+            : Results.Json(new { status = "not_ready", reason = "migrations_pending" }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+    catch (Exception ex) when (ex is not OperationCanceledException)
+    {
+        logger.LogWarning(ex, "Readiness check failed");
+        return Results.Json(new { status = "not_ready", reason = "database_unavailable" }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+});
 
 // --- Razor Pages ---
 app.MapRazorPages();
@@ -250,13 +316,11 @@ app.MapReverseProxy(proxyPipeline =>
                 return;
             }
 
-            // 2. The proxy is only accessible via OIDC client tokens.
-            //    Prefer azp (authorized party); fall back to aud (audience) which Dex
-            //    sets to the client_id when there is only one audience.
-            //    Cookie-session users have neither claim and are redirected to use a
-            //    registered OIDC client instead.
-            var clientId = ctx.User.FindFirstValue("azp")
-                        ?? ctx.User.FindFirstValue("aud");
+            // 2. The proxy is only accessible via OIDC client tokens issued to a configured
+            //    proxy client. azp (authorized party) wins; otherwise the token must have
+            //    exactly one audience. Cookie-session users have neither claim and are
+            //    redirected to use a registered OIDC client instead.
+            var clientId = OidcClientIdentity.Resolve(ctx.User, proxyClients.AllowedClientIds);
             if (clientId is null)
             {
                 ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
@@ -269,7 +333,17 @@ app.MapReverseProxy(proxyPipeline =>
 
             var email = ctx.User.FindFirstValue(ClaimTypes.Email);
 
-            // 3. Capability check — every JWT client must have an explicit grant.
+            // 3. The user must still be on the sign-in allow-list.
+            if (!signInPolicy.IsAllowed(email))
+            {
+                ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync("""{"error":"user_not_allowed"}""");
+                await audit.RecordAsync(operationId, email, clientId, "denied_user_not_allowed", 403);
+                return;
+            }
+
+            // 4. Capability check — every JWT client must have an explicit grant.
             if (metadata["AuthOnly"] != "true")
             {
                 var capability = metadata["Capability"];
@@ -286,7 +360,7 @@ app.MapReverseProxy(proxyPipeline =>
                 }
             }
 
-            // 4. Inject the user's own bunny.net API key via Items so the transform
+            // 5. Inject the user's own bunny.net API key via Items so the transform
             //    can add it to the proxy request after header copying.
             if (metadata["CredentialKind"] == "AccountApiKey")
             {
@@ -331,3 +405,6 @@ app.MapReverseProxy(proxyPipeline =>
 });
 
 app.Run();
+
+/// <summary>Exposed for WebApplicationFactory in the integration tests.</summary>
+public partial class Program;

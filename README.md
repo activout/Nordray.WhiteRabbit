@@ -37,7 +37,7 @@ OIDC client (app, CLI, ...)
 
 1. A user signs in with their email address — White Rabbit sends a 6-digit one-time code.
 2. On first access from a client application, the user sees a consent screen listing the capabilities the client is requesting.
-3. Approved grants are stored in SQLite. Subsequent requests from the same client skip the consent step.
+3. Approved grants are stored in the database. Subsequent requests from the same client skip the consent step.
 4. White Rabbit looks up every incoming proxy request in a hard-coded operation registry. Anything not in the registry is rejected with `404`. Anything the client hasn't been granted is rejected with `403`.
 5. Approved requests have the user's bunny.net API key injected server-side and are forwarded to `https://api.bunny.net` via YARP.
 
@@ -69,7 +69,7 @@ New endpoints require a code review and an explicit entry in `BunnyOperationRegi
 | Web host | ASP.NET Core 10 |
 | OIDC provider | [Dex](https://dexidp.io) (authproxy connector) |
 | Proxy forwarding | YARP (reverse proxy pipeline) |
-| Database | SQLite via [Activout.DatabaseClient](https://github.com/activout/Activout.DatabaseClient) |
+| Database | libSQL (a local file, or [Bunny Database](https://bunny.net/database/) when deployed) via [Activout.DatabaseClient](https://github.com/twogood/Activout.DatabaseClient) and its `LibSqlGateway` |
 | Email | Mailjet (SMTP/Mailpit fallback for local dev) |
 | Tests | xUnit, RichardSzalay.MockHttp |
 
@@ -103,12 +103,30 @@ Secrets are **never** stored in `appsettings` files. All sensitive values are su
 
 | Variable | Purpose |
 |---|---|
+| `WhiteRabbit_DataProtection__EncryptionKey` | **Required.** Base64 of 32 random bytes (`openssl rand -base64 32`). Encrypts the Data Protection key ring stored in the database, which in turn protects every stored bunny.net API key. Keep it with the database backup, separately protected: without it the stored keys cannot be read. White Rabbit refuses to start without it |
+| `WhiteRabbit_Database__ConnectionString` | `Data Source=<file>` locally, or `Data Source=https://<database>.lite.bunnydb.net;Auth Token=<token>` for Bunny Database |
 | `WhiteRabbit_Dex__ClientSecret` | Shared secret between White Rabbit and Dex |
 | `WhiteRabbit_Mailjet__ApiKey` | Mailjet API key (omit to use SMTP fallback) |
 | `WhiteRabbit_Mailjet__SecretKey` | Mailjet secret key |
 | `WhiteRabbit_Mailjet__FromEmail` | Sender address |
 
+Non-secret settings that every instance must choose:
+
+| Setting | Purpose |
+|---|---|
+| `Access:AllowedEmails`, `Access:AllowedDomains` | Who may sign in (e.g. `WhiteRabbit_Access__AllowedEmails__0=you@example.com`). **Empty means nobody**, so an instance never collects strangers' bunny.net keys by accident. Removing an address ends its sessions and proxy access |
+| `Proxy:AllowedClientIds` | OIDC client IDs whose tokens the Bunny proxy accepts (e.g. `WhiteRabbit_Proxy__AllowedClientIds__0=example-client`). Tokens for any other audience are rejected. Empty means none |
+
 See [`.env.example`](.env.example) for a full template.
+
+### Health
+
+- `GET /health`: the process is running.
+- `GET /ready`: the database answers and every migration shipped with this build has been applied. Returns 503 otherwise, without connection details.
+
+### Database
+
+The same libSQL provider serves a local file, an in-memory database in tests and Bunny Database in production. The schema lives in numbered migrations (`src/Nordray.WhiteRabbit.Infrastructure/Database/Schema/NNN_name.sql`), applied once each at start-up and recorded in `SchemaMigrations`. Never edit an applied migration; add a new numbered file. The native libSQL library ships for linux-x64, linux-arm64, macOS arm64 and Windows x64; Intel Macs are not supported for local development.
 
 ## Deployment
 
@@ -117,7 +135,7 @@ White Rabbit is designed to run as a two-container application on [bunny.net Mag
 - `white-rabbit` on port `8080`
 - `dex` on port `5556`
 
-Both containers communicate over `localhost`. SQLite data should be placed on persistent storage.
+Both containers communicate over `localhost`. White Rabbit's data, including the encrypted Data Protection key ring, lives in its database (Bunny Database when deployed); Dex keeps its own SQLite file on a persistent volume.
 
 ## Project layout
 
@@ -125,7 +143,7 @@ Both containers communicate over `localhost`. SQLite data should be placed on pe
 src/
   Nordray.WhiteRabbit.Web            ASP.NET Core host, Razor pages, middleware pipeline
   Nordray.WhiteRabbit.Core           Domain types — BunnyOperation, capabilities, models
-  Nordray.WhiteRabbit.Infrastructure SQLite repositories, Mailjet/SMTP email service
+  Nordray.WhiteRabbit.Infrastructure libSQL DAOs and migrations, Mailjet/SMTP email service
   Nordray.WhiteRabbit.Proxy          BunnyHttpClientFactory, ISRG Root X1 certificate pinning
   Nordray.WhiteRabbit.Bunny          BunnyOperationRegistry (the hard-coded allow-list)
   Nordray.WhiteRabbit.AuthProxy      DexAuthProxyMiddleware, X-Remote-User injection
