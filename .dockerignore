@@ -1,0 +1,15 @@
+**/bin/
+**/obj/
+**/.vs/
+**/*.db
+**/*.db-*
+.git/
+.github/
+cli/
+data/
+docs/
+examples/
+deploy/
+*.md
+.env
+.env.*
