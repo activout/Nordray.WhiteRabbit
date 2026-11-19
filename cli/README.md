@@ -88,6 +88,8 @@ rabbit admin bindings rm 3
 
 See [`examples/ci`](../examples/ci) for complete workflows.
 
+AI agents: [`skills/rabbit/SKILL.md`](../skills/rabbit/SKILL.md) describes how to use rabbit and manage bindings. Copy it to `~/.claude/skills/rabbit/`.
+
 ## Other variables
 
 `RABBIT_AUTH=ci|interactive` overrides CI detection. `RABBIT_BUNNY` is the BunnyCLI path (default: `bunny` on `PATH`).
