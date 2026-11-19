@@ -7,7 +7,15 @@ namespace Nordray.WhiteRabbit.Infrastructure.Database;
 /// <summary>
 /// Applies the embedded <c>Database/Schema/NNN_name.sql</c> files in order, once each, and records them in
 /// <c>SchemaMigrations</c>. Bootstrap code, so it uses plain ADO.NET commands without parameters.
-/// Never edit an applied migration; add a new numbered file. A failed migration is fixed forward with a new one.
+/// <para>
+/// Each migration runs in one transaction together with its <c>SchemaMigrations</c> row, so a crash or error leaves
+/// it either fully applied and recorded or not at all (SQLite and libSQL roll back DDL). The row is inserted first:
+/// that takes the database's write lock, so a second instance starting at the same time cannot apply the same
+/// migration. The libSQL provider neither waits for locks nor tells a lock apart from other errors, so a failed run
+/// is retried a few times with a short back-off: an instance that lost the race then finds the migration applied,
+/// while a genuinely broken migration is rolled back each time and finally fails start-up.
+/// </para>
+/// Never edit an applied migration; add a new numbered file.
 /// </summary>
 public sealed class DatabaseMigrator(DbConnection connection, ILogger<DatabaseMigrator> logger)
 {
@@ -18,30 +26,54 @@ public sealed class DatabaseMigrator(DbConnection connection, ILogger<DatabaseMi
     /// <summary>All migrations shipped with this build, ordered by version.</summary>
     public static IReadOnlyList<Migration> Embedded { get; } = LoadEmbedded();
 
-    public async Task MigrateAsync(CancellationToken ct = default)
+    private const int Attempts = 5;
+
+    public Task MigrateAsync(CancellationToken ct = default) => MigrateAsync(Embedded, ct);
+
+    /// <summary>Applies the given migrations (the embedded ones in production; tests pass their own).</summary>
+    internal async Task MigrateAsync(IEnumerable<Migration> migrations, CancellationToken ct = default)
     {
-        await EnsureOpenAsync(ct);
-        await ExecuteAsync("""
-            CREATE TABLE IF NOT EXISTS SchemaMigrations (
-                Version    INTEGER NOT NULL PRIMARY KEY,
-                Name       TEXT    NOT NULL,
-                AppliedUtc TEXT    NOT NULL
-            )
-            """, ct);
-
-        var applied = await AppliedVersionsAsync(ct);
-        foreach (var migration in Embedded.Where(m => !applied.Contains(m.Version)))
+        var ordered = migrations.OrderBy(m => m.Version).ToList();
+        for (var attempt = 1; ; attempt++)
         {
-            logger.LogInformation("Applying migration {Version} {Name}", migration.Version, migration.Name);
-            // Statement by statement: libSQL over HTTP does not accept a multi-statement batch in one command.
-            foreach (var statement in SplitStatements(migration.Sql))
-                await ExecuteAsync(statement, ct);
-
-            // Version is an integer and Name comes from an embedded resource name checked in LoadEmbedded.
-            var now = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture);
-            await ExecuteAsync(
-                $"INSERT INTO SchemaMigrations (Version, Name, AppliedUtc) VALUES ({migration.Version}, '{migration.Name}', '{now}')", ct);
+            try
+            {
+                await EnsureOpenAsync(ct);
+                await ExecuteAsync(
+                    "CREATE TABLE IF NOT EXISTS SchemaMigrations (Version INTEGER NOT NULL PRIMARY KEY, Name TEXT NOT NULL, AppliedUtc TEXT NOT NULL)",
+                    ct);
+                foreach (var migration in ordered)
+                {
+                    if (!(await AppliedVersionsAsync(ct)).Contains(migration.Version))
+                        await ApplyAsync(migration, ct);
+                }
+                return;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                if (attempt == Attempts)
+                    throw new InvalidOperationException($"Database migration failed {Attempts} times; every failed migration was rolled back.", ex);
+                logger.LogWarning(ex, "Database migration attempt {Attempt} failed (another instance may hold the lock); retrying", attempt);
+                await Task.Delay(TimeSpan.FromMilliseconds(100 * attempt * attempt), ct);
+            }
         }
+    }
+
+    private async Task ApplyAsync(Migration migration, CancellationToken ct)
+    {
+        logger.LogInformation("Applying migration {Version} {Name}", migration.Version, migration.Name);
+        await using var tx = await connection.BeginTransactionAsync(ct);
+
+        // Version is an integer and Name comes from an embedded resource name checked in LoadEmbedded.
+        var now = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture);
+        await ExecuteAsync(
+            $"INSERT INTO SchemaMigrations (Version, Name, AppliedUtc) VALUES ({migration.Version}, '{migration.Name}', '{now}')", ct, tx);
+
+        // Statement by statement: libSQL over HTTP does not accept a multi-statement batch in one command.
+        foreach (var statement in SplitStatements(migration.Sql))
+            await ExecuteAsync(statement, ct, tx);
+
+        await tx.CommitAsync(ct);
     }
 
     /// <summary>Migrations shipped with this build that the database has not applied. Used by the readiness check.</summary>
@@ -92,10 +124,11 @@ public sealed class DatabaseMigrator(DbConnection connection, ILogger<DatabaseMi
             await connection.OpenAsync(ct);
     }
 
-    private async Task ExecuteAsync(string sql, CancellationToken ct)
+    private async Task ExecuteAsync(string sql, CancellationToken ct, DbTransaction? transaction = null)
     {
         await using var command = connection.CreateCommand();
         command.CommandText = sql;
+        command.Transaction = transaction;
         await command.ExecuteNonQueryAsync(ct);
     }
 

@@ -48,6 +48,7 @@ builder.Services.AddScoped<CapabilitySeeder>();
 // DataProtection:EncryptionKey) instead of the container's file system, which is lost on replacement.
 // The application name is fixed so keys stay valid when the content root or container path changes.
 builder.Services.AddDataProtection().SetApplicationName("Nordray.WhiteRabbit");
+builder.Services.AddSingleton<KeyRingVerifier>();
 builder.Services.AddOptions<KeyManagementOptions>().Configure<IServiceProvider>((keys, services) =>
 {
     keys.XmlRepository = new DatabaseKeyRing(services);
@@ -83,9 +84,15 @@ builder.Services.AddAuthentication(options =>
 })
 .AddPolicyScheme("SmartScheme", "Cookie or Bearer", options =>
 {
+    // Each credential is accepted only where it belongs: White Rabbit sessions (wrs_…) on the CLI and admin API, Dex
+    // bearer tokens on Bunny proxy routes. Everywhere else (UI pages, consent, the Dex /auth flow) the
+    // allow-list-validated cookie is required, whatever Authorization header the request carries.
     options.ForwardDefaultSelector = ctx =>
-        CliSessionAuthenticationHandler.Carries(ctx.Request) ? CliSessionAuthenticationHandler.SchemeName
-        : ctx.Request.Headers.ContainsKey("Authorization") ? JwtBearerDefaults.AuthenticationScheme
+        (ctx.Request.Path.StartsWithSegments("/api/cli", StringComparison.OrdinalIgnoreCase)
+         || ctx.Request.Path.StartsWithSegments("/api/admin", StringComparison.OrdinalIgnoreCase))
+        && CliSessionAuthenticationHandler.Carries(ctx.Request) ? CliSessionAuthenticationHandler.SchemeName
+        : ctx.Request.Path.StartsWithSegments("/proxy", StringComparison.OrdinalIgnoreCase)
+        && ctx.Request.Headers.ContainsKey("Authorization") ? JwtBearerDefaults.AuthenticationScheme
         : CookieAuthenticationDefaults.AuthenticationScheme;
 })
 .AddCookie(CookieAuthenticationDefaults.AuthenticationScheme, options =>
@@ -284,6 +291,9 @@ if (proxyClients.AllowedClientIds.Count == 0)
 
 // Ensure database schema exists and capabilities are seeded before serving requests
 await app.Services.GetRequiredService<DatabaseInitializer>().InitializeAsync();
+// Refuse to start with a key that cannot read the stored key ring, or with stored Bunny keys but no key ring:
+// either would make every stored Bunny API key unreadable while the service reported itself ready.
+await app.Services.GetRequiredService<KeyRingVerifier>().VerifyAsync();
 using (var scope = app.Services.CreateScope())
 {
     await scope.ServiceProvider.GetRequiredService<CapabilitySeeder>().SeedAsync();
