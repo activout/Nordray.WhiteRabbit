@@ -1,0 +1,64 @@
+name: PR
+
+# The single workflow that validates pull requests. It runs on every PR,
+# runs only the parts the PR touches, and ends in `ci-ok`, the one check
+# branch protection on main requires. Jobs skipped as irrelevant count as
+# passing; a failed or cancelled job fails `ci-ok`.
+
+on: pull_request
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      server: ${{ steps.filter.outputs.server }}
+      cli: ${{ steps.filter.outputs.cli }}
+    steps:
+      - id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename')
+          printf '%s\n' "$files"
+          # Server: anything outside cli/ that is not Markdown (same as image.yml's paths-ignore).
+          server=false; grep -Ev '^cli/|\.md$' <<<"$files" >/dev/null && server=true
+          cli=false; grep -E '^cli/|^\.github/workflows/(cli|cli-test|pr)\.yml$' <<<"$files" >/dev/null && cli=true
+          echo "server=$server" >> "$GITHUB_OUTPUT"
+          echo "cli=$cli" >> "$GITHUB_OUTPUT"
+
+  server:
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
+    uses: ./.github/workflows/server-test.yml
+
+  image:
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build --platform linux/amd64 -f src/Nordray.WhiteRabbit.Web/Dockerfile .
+
+  cli:
+    needs: changes
+    if: needs.changes.outputs.cli == 'true'
+    uses: ./.github/workflows/cli-test.yml
+
+  ci-ok:
+    if: always()
+    needs: [changes, server, image, cli]
+    runs-on: ubuntu-latest
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "All required PR checks passed or were not needed."
