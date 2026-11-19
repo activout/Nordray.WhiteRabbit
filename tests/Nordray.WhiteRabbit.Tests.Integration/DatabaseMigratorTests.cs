@@ -40,7 +40,7 @@ public class DatabaseMigratorTests
     {
         await using var db = await TestDatabase.CreateAsync(migrate: false);
         await using var connection = db.Factory.Create();
-        var migrator = new DatabaseMigrator(connection, NullLogger<DatabaseMigrator>.Instance);
+        var migrator = new DatabaseMigrator(connection, NullLogger<DatabaseMigrator>.Instance) { RetryDelay = TimeSpan.Zero };
         var broken = new DatabaseMigrator.Migration(1, "001_broken", "CREATE TABLE Half (Id INTEGER); INSERT INTO NoSuchTable VALUES (1);");
 
         await Assert.ThrowsAnyAsync<Exception>(() => migrator.MigrateAsync([broken]));

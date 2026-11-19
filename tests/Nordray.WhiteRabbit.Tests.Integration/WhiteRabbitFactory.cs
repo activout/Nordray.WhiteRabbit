@@ -55,6 +55,8 @@ public sealed class WhiteRabbitFactory(string connectionString, string encryptio
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Testing");
+        // Each host would otherwise watch the appsettings files; on macOS that costs ~100 ms per test.
+        builder.UseSetting("hostBuilder:reloadConfigOnChange", "false");
         builder.UseSetting("Database:ConnectionString", connectionString);
         builder.UseSetting("DataProtection:EncryptionKey", encryptionKey);
         builder.UseSetting("Access:AllowedEmails:0", AllowedEmail);

@@ -28,6 +28,9 @@ public sealed class DatabaseMigrator(DbConnection connection, ILogger<DatabaseMi
 
     private const int Attempts = 5;
 
+    /// <summary>Back-off unit between attempts (grows quadratically). Tests shorten it.</summary>
+    internal TimeSpan RetryDelay { get; init; } = TimeSpan.FromMilliseconds(100);
+
     public Task MigrateAsync(CancellationToken ct = default) => MigrateAsync(Embedded, ct);
 
     /// <summary>Applies the given migrations (the embedded ones in production; tests pass their own).</summary>
@@ -54,7 +57,7 @@ public sealed class DatabaseMigrator(DbConnection connection, ILogger<DatabaseMi
                 if (attempt == Attempts)
                     throw new InvalidOperationException($"Database migration failed {Attempts} times; every failed migration was rolled back.", ex);
                 logger.LogWarning(ex, "Database migration attempt {Attempt} failed (another instance may hold the lock); retrying", attempt);
-                await Task.Delay(TimeSpan.FromMilliseconds(100 * attempt * attempt), ct);
+                await Task.Delay(RetryDelay * (attempt * attempt), ct);
             }
         }
     }
