@@ -303,3 +303,71 @@ func TestLoginRejectsUnknownCapabilityBeforeOpeningTheBrowser(t *testing.T) {
 		t.Fatalf("exit %d, browser opened %v: %s", code, opened, h.stderr)
 	}
 }
+
+func TestSkillInstall(t *testing.T) {
+	h := newHarness(t)
+	home := t.TempDir()
+	h.vars["HOME"] = home
+	claudeSkill := filepath.Join(home, ".claude", "skills", "rabbit", "SKILL.md")
+	agentsSkill := filepath.Join(home, ".agents", "skills", "rabbit", "SKILL.md")
+
+	if code := h.run("skill", "install"); code != 1 {
+		t.Fatal("with neither ~/.claude nor ~/.agents, install must fail and point at --dir")
+	}
+
+	if err := os.Mkdir(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if code := h.run("skill", "install"); code != 0 {
+		t.Fatalf("exit %d: %s", code, h.stderr)
+	}
+	got, err := os.ReadFile(claudeSkill)
+	if err != nil || !strings.HasPrefix(string(got), "---\nname: rabbit\n") {
+		t.Fatalf("SKILL.md at %s: %v %q", claudeSkill, err, got)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".agents")); err == nil {
+		t.Fatal("~/.agents must not be created when it is not in use")
+	}
+
+	if err := os.Mkdir(filepath.Join(home, ".agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h.run("skill", "install")
+	if _, err := os.Stat(agentsSkill); err != nil {
+		t.Fatal("an existing ~/.agents must get the skill too:", err)
+	}
+
+	h.vars["CLAUDE_CONFIG_DIR"] = t.TempDir()
+	h.run("skill", "install")
+	if _, err := os.Stat(filepath.Join(h.vars["CLAUDE_CONFIG_DIR"], "skills", "rabbit", "SKILL.md")); err != nil {
+		t.Fatal("CLAUDE_CONFIG_DIR must be honoured:", err)
+	}
+
+	dir := filepath.Join(t.TempDir(), "agent")
+	if code := h.run("skill", "install", "--dir", dir); code != 0 {
+		t.Fatalf("--dir: exit %d: %s", code, h.stderr)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "SKILL.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	h.stdout.Reset()
+	if code := h.run("skill", "print"); code != 0 || !bytes.Equal(h.stdout.Bytes(), got) {
+		t.Fatal("skill print must write the same SKILL.md")
+	}
+}
+
+func TestHomeDir_PrefersTheProfileOnWindows(t *testing.T) {
+	env := map[string]string{"HOME": "/c/Users/me/msys-home", "USERPROFILE": `C:\Users\me`}
+	get := func(k string) string { return env[k] }
+	if got := homeDir("windows", get); got != `C:\Users\me` {
+		t.Fatalf("windows: %q", got)
+	}
+	if got := homeDir("darwin", get); got != "/c/Users/me/msys-home" {
+		t.Fatalf("darwin: %q", got)
+	}
+	delete(env, "USERPROFILE")
+	if got := homeDir("windows", get); got != "/c/Users/me/msys-home" {
+		t.Fatalf("windows without USERPROFILE falls back to HOME: %q", got)
+	}
+}

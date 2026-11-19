@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -24,6 +25,7 @@ import (
 	"github.com/activout/nordray.whiterabbit/cli/internal/login"
 	"github.com/activout/nordray.whiterabbit/cli/internal/passthrough"
 	"github.com/activout/nordray.whiterabbit/cli/internal/secrets"
+	"github.com/activout/nordray.whiterabbit/cli/internal/skill"
 )
 
 // Version is set at build time with -ldflags "-X .../internal/app.Version=v1.2.3".
@@ -135,6 +137,7 @@ White Rabbit commands:
   auth logout                                      Revoke and forget the session
   env list | add NAME URL | use NAME | remove NAME Manage White Rabbit servers
   admin bindings list | add ... | rm ID            Manage CI workload bindings (interactive session only)
+  skill install [--dir DIR] | print                Install the AI agent skill (~/.claude/skills, ~/.agents/skills)
   version
 
 Everything after the first standalone -- is passed unchanged to BunnyCLI (bunny), for example
@@ -177,8 +180,75 @@ func (a *App) command(ctx context.Context, envFlag, serverFlag, name string, arg
 			return 1, err
 		}
 		return a.bindings(ctx, args[1], args[2:])
+	case "skill":
+		return a.skillCommand(args)
 	}
 	return 2, usageError{fmt.Sprintf("unknown command %q (BunnyCLI commands go after `--`, e.g. rabbit -- %s)", name, name)}
+}
+
+// ---------------------------------------------------------------- agent skill
+
+// skillCommand installs or prints the embedded SKILL.md. Install overwrites, so it always matches this binary.
+func (a *App) skillCommand(args []string) (int, error) {
+	if len(args) > 0 && args[0] == "print" {
+		_, err := a.Stdout.Write(skill.Markdown)
+		return 0, err
+	}
+	if len(args) == 0 || args[0] != "install" {
+		return 2, usageError{"usage: rabbit skill install [--dir DIR] | print"}
+	}
+	fs := flag.NewFlagSet("skill install", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	dir := fs.String("dir", "", "write SKILL.md only to this directory")
+	if err := fs.Parse(args[1:]); err != nil {
+		return 2, usageError{err.Error()}
+	}
+	dirs := []string{*dir}
+	if *dir == "" {
+		home := homeDir(runtime.GOOS, a.Getenv)
+		claude := a.Getenv("CLAUDE_CONFIG_DIR")
+		if claude == "" && home != "" {
+			claude = filepath.Join(home, ".claude")
+		}
+		agents := "" // the shared Agent Skills folder: Codex, Gemini CLI, GitHub Copilot, OpenCode
+		if home != "" {
+			agents = filepath.Join(home, ".agents")
+		}
+		// Only for agents that are in use: their configuration directory exists.
+		dirs = nil
+		for _, base := range []string{claude, agents} {
+			if info, err := os.Stat(base); base != "" && err == nil && info.IsDir() {
+				dirs = append(dirs, filepath.Join(base, "skills", "rabbit"))
+			}
+		}
+		if len(dirs) == 0 {
+			return 1, errors.New("found neither ~/.claude nor ~/.agents; use --dir for another agent's skill directory")
+		}
+	}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return 1, err
+		}
+		path := filepath.Join(d, "SKILL.md")
+		if err := os.WriteFile(path, skill.Markdown, 0o644); err != nil {
+			return 1, err
+		}
+		fmt.Fprintf(a.Stdout, "Installed the rabbit skill at %s.\n", path)
+	}
+	return 0, nil
+}
+
+// homeDir is the directory agents put ~/.claude and ~/.agents in. On Windows that is the user profile, even when
+// Git Bash or MSYS sets HOME elsewhere: Claude Code and the other agents use the profile there.
+func homeDir(goos string, getenv func(string) string) string {
+	first, second := "HOME", "USERPROFILE"
+	if goos == "windows" {
+		first, second = second, first
+	}
+	if h := getenv(first); h != "" {
+		return h
+	}
+	return getenv(second)
 }
 
 // ---------------------------------------------------------------- environments

@@ -8,6 +8,7 @@ description: Run bunny.net's BunnyCLI through a Nordray White Rabbit server with
 `rabbit -- <bunny arguments>` runs the official BunnyCLI (`bunny`) through a White Rabbit server. Neither the agent
 nor a CI job ever holds the real bunny.net API key. White Rabbit allows only the operations in its registry, and only
 with the capabilities the session was granted. Details: `cli/README.md` in github.com/activout/Nordray.WhiteRabbit.
+This file comes with rabbit: `rabbit skill install` updates it to match the installed version.
 
 ## Rules for the agent
 
