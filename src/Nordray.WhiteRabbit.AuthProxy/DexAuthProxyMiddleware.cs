@@ -1,6 +1,7 @@
 using System.Security.Claims;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.WebUtilities;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Primitives;
 using Nordray.WhiteRabbit.Core.Services;
@@ -15,6 +16,8 @@ namespace Nordray.WhiteRabbit.AuthProxy;
 ///    the requested capabilities to the client. Redirects to /consent if not.
 /// 4. Sets the authenticated user's email in HttpContext.Items so the YARP
 ///    transformer can inject it as X-Remote-User before forwarding to Dex.
+/// Authorization requests from the public rabbit CLI client (Cli:DexClientId) must use the authorization code
+/// flow with PKCE S256: Dex accepts public-client logins without PKCE, so White Rabbit refuses them here.
 /// </summary>
 public sealed class DexAuthProxyMiddleware(RequestDelegate next)
 {
@@ -30,6 +33,24 @@ public sealed class DexAuthProxyMiddleware(RequestDelegate next)
         context.Request.Headers.Remove("X-Remote-User");
         context.Request.Headers.Remove("X-Remote-Groups");
         context.Request.Headers.Remove("X-Remote-Extra");
+
+        // RFC 6749 §3.1: request parameters must not be repeated. White Rabbit and Dex could otherwise read different
+        // values (e.g. client_id=rabbit-cli&client_id=other), letting a request slip past the checks below.
+        if (HasRepeatedAuthorizationParameter(context))
+        {
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            context.Response.ContentType = "text/plain";
+            await context.Response.WriteAsync("Authorization request parameters must not be repeated.");
+            return;
+        }
+
+        if (IsPublicClientRequestWithoutPkce(context))
+        {
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            context.Response.ContentType = "text/plain";
+            await context.Response.WriteAsync("The rabbit CLI client must use response_type=code with PKCE (code_challenge_method=S256).");
+            return;
+        }
 
         if (context.User.Identity?.IsAuthenticated != true)
         {
@@ -68,6 +89,23 @@ public sealed class DexAuthProxyMiddleware(RequestDelegate next)
         StripCapabilityScopes(context);
 
         await next(context);
+    }
+
+    private static readonly string[] AuthorizationParameters =
+        ["client_id", "response_type", "redirect_uri", "scope", "state", "nonce", "code_challenge", "code_challenge_method", "prompt"];
+
+    private static bool HasRepeatedAuthorizationParameter(HttpContext context) =>
+        AuthorizationParameters.Any(name => context.Request.Query[name].Count > 1);
+
+    private static bool IsPublicClientRequestWithoutPkce(HttpContext context)
+    {
+        var cliClientId = context.RequestServices.GetService<IConfiguration>()?["Cli:DexClientId"] ?? "rabbit-cli";
+        var query = context.Request.Query;
+        if (!string.Equals(query["client_id"].ToString(), cliClientId, StringComparison.Ordinal))
+            return false;
+        return !string.Equals(query["response_type"].ToString(), "code", StringComparison.Ordinal)
+            || !string.Equals(query["code_challenge_method"].ToString(), "S256", StringComparison.Ordinal)
+            || query["code_challenge"].ToString().Length < 43;
     }
 
     public static string? GetRemoteUser(HttpContext context) =>

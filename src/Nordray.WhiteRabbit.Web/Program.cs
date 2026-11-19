@@ -15,6 +15,8 @@ using Nordray.WhiteRabbit.Infrastructure.Database;
 using Nordray.WhiteRabbit.Infrastructure.Encryption;
 using Nordray.WhiteRabbit.Proxy;
 using Nordray.WhiteRabbit.Web;
+using Nordray.WhiteRabbit.Web.Cli;
+using Nordray.WhiteRabbit.Web.Proxy;
 using Nordray.WhiteRabbit.Web.DataProtection;
 using System.Threading.RateLimiting;
 using Yarp.ReverseProxy.Configuration;
@@ -60,9 +62,21 @@ var proxyClients = new ProxyClientOptions(
     configuration.GetSection("Proxy:AllowedClientIds").Get<string[]>() ?? []);
 builder.Services.AddSingleton(proxyClients);
 
+// --- rabbit CLI: sessions, CI federation, virtual credentials ---
+builder.Services.Configure<CliOptions>(configuration.GetSection("Cli"));
+builder.Services.Configure<FederationOptions>(configuration.GetSection("Federation"));
+builder.Services.AddHttpClient("oidc-metadata", c => c.Timeout = TimeSpan.FromSeconds(10));
+builder.Services.AddSingleton<IOidcMetadataProvider, OidcMetadataProvider>();
+builder.Services.AddSingleton<IdentityTokenValidator>();
+builder.Services.AddScoped<CliPrincipalResolver>();
+builder.Services.AddScoped<SecurityAudit>();
+builder.Services.AddSingleton<BunnyProxyGate>();
+builder.Services.AddHttpContextAccessor();
+
 // --- Authentication ---
-// Cookie for White Rabbit UI; JWT Bearer for OIDC clients calling the proxy.
-// A policy scheme selects the right handler based on the presence of Authorization header.
+// Cookie for the White Rabbit UI; JWT Bearer for Dex tokens of OIDC clients calling the proxy; CliSession for
+// White Rabbit session tokens (wrs_…) on the CLI and admin API. A policy scheme picks one per request.
+// Virtual credentials (AccessKey: wrk_…) are not an authentication scheme: only BunnyProxyGate accepts them.
 builder.Services.AddAuthentication(options =>
 {
     options.DefaultScheme = "SmartScheme";
@@ -70,13 +84,16 @@ builder.Services.AddAuthentication(options =>
 })
 .AddPolicyScheme("SmartScheme", "Cookie or Bearer", options =>
 {
-    // Dex bearer tokens are accepted only on Bunny proxy routes. Everywhere else (UI pages, consent, the Dex /auth
-    // flow) the allow-list-validated cookie is required, whatever Authorization header the request carries.
+    // Each credential is accepted only where it belongs: White Rabbit sessions (wrs_…) on the CLI and admin API, Dex
+    // bearer tokens on Bunny proxy routes. Everywhere else (UI pages, consent, the Dex /auth flow) the
+    // allow-list-validated cookie is required, whatever Authorization header the request carries.
     options.ForwardDefaultSelector = ctx =>
-        ctx.Request.Path.StartsWithSegments("/proxy", StringComparison.OrdinalIgnoreCase)
-        && ctx.Request.Headers.ContainsKey("Authorization")
-            ? JwtBearerDefaults.AuthenticationScheme
-            : CookieAuthenticationDefaults.AuthenticationScheme;
+        (ctx.Request.Path.StartsWithSegments("/api/cli", StringComparison.OrdinalIgnoreCase)
+         || ctx.Request.Path.StartsWithSegments("/api/admin", StringComparison.OrdinalIgnoreCase))
+        && CliSessionAuthenticationHandler.Carries(ctx.Request) ? CliSessionAuthenticationHandler.SchemeName
+        : ctx.Request.Path.StartsWithSegments("/proxy", StringComparison.OrdinalIgnoreCase)
+        && ctx.Request.Headers.ContainsKey("Authorization") ? JwtBearerDefaults.AuthenticationScheme
+        : CookieAuthenticationDefaults.AuthenticationScheme;
 })
 .AddCookie(CookieAuthenticationDefaults.AuthenticationScheme, options =>
 {
@@ -113,9 +130,21 @@ builder.Services.AddAuthentication(options =>
         RequireExpirationTime = true,
         AudienceValidator = (audiences, _, _) => audiences.Any(proxyClients.AllowedClientIds.Contains),
     };
-});
+})
+.AddScheme<AuthenticationSchemeOptions, CliSessionAuthenticationHandler>(CliSessionAuthenticationHandler.SchemeName, null);
 
-builder.Services.AddAuthorization();
+builder.Services.AddAuthorization(options =>
+{
+    // The CLI API accepts only White Rabbit session tokens: never cookies, Dex tokens or virtual credentials.
+    options.AddPolicy(CliEndpoints.SessionPolicy, policy => policy
+        .AddAuthenticationSchemes(CliSessionAuthenticationHandler.SchemeName)
+        .RequireAuthenticatedUser());
+    // Binding administration additionally requires an interactive human session; CI sessions are refused.
+    options.AddPolicy(CliEndpoints.HumanPolicy, policy => policy
+        .AddAuthenticationSchemes(CliSessionAuthenticationHandler.SchemeName)
+        .RequireAuthenticatedUser()
+        .RequireClaim(CliSessionAuthenticationHandler.PrincipalTypeClaim, Nordray.WhiteRabbit.Core.Models.PrincipalTypes.Human));
+});
 
 // --- Rate limiting ---
 builder.Services.AddRateLimiter(opts =>
@@ -136,6 +165,14 @@ builder.Services.AddRateLimiter(opts =>
         o.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
         o.QueueLimit = 0;
     });
+
+    // Token exchange and the CLI API, per client address.
+    opts.AddPolicy(CliEndpoints.ExchangeRateLimit, ctx => RateLimitPartition.GetFixedWindowLimiter(
+        ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 30, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
+    opts.AddPolicy(CliEndpoints.ApiRateLimit, ctx => RateLimitPartition.GetFixedWindowLimiter(
+        ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 300, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
 
     opts.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 });
@@ -224,7 +261,7 @@ builder.Services.AddReverseProxy()
             ctx.AddRequestTransform(transform =>
             {
                 transform.ProxyRequest.Headers.Host = "api.bunny.net";
-                if (transform.HttpContext.Items["bunny.access-key"] is string apiKey)
+                if (transform.HttpContext.Items[BunnyProxyGate.AccessKeyItem] is string apiKey)
                     transform.ProxyRequest.Headers.TryAddWithoutValidation("AccessKey", apiKey);
                 return ValueTask.CompletedTask;
             });
@@ -251,11 +288,6 @@ if (!signInPolicy.AllowsAnyone)
 if (proxyClients.AllowedClientIds.Count == 0)
     app.Logger.LogWarning("Proxy:AllowedClientIds is empty: the Bunny proxy accepts no bearer tokens.");
 
-// Create a named data protector for encrypting/decrypting stored bunny API keys.
-// The purpose string is versioned so it can be rotated in the future.
-var bunnyKeyProtector = app.Services
-    .GetRequiredService<IDataProtectionProvider>()
-    .CreateProtector("BunnyApiKey.v1");
 
 // Ensure database schema exists and capabilities are seeded before serving requests
 await app.Services.GetRequiredService<DatabaseInitializer>().InitializeAsync();
@@ -267,6 +299,7 @@ using (var scope = app.Services.CreateScope())
     await scope.ServiceProvider.GetRequiredService<CapabilitySeeder>().SeedAsync();
 }
 
+app.UseCorrelationId();
 app.UseStaticFiles();
 app.UseAuthentication();
 app.UseAuthorization();
@@ -298,12 +331,30 @@ app.MapGet("/ready", async (DbConnection connection, ILogger<DatabaseMigrator> l
     }
 });
 
+// --- rabbit CLI and binding administration API ---
+app.MapCliEndpoints();
+
+// Any /proxy path that is not a registered Bunny operation: never forwarded, but audited like every other proxy
+// decision. Registered operations are literal YARP routes, which take precedence over this catch-all.
+app.Map("/proxy/{**path}", async (HttpContext ctx, SecurityAudit audit) =>
+{
+    await audit.RecordAsync(new Nordray.WhiteRabbit.Core.Models.SecurityEvent
+    {
+        EventType = "proxy.request",
+        Outcome = Nordray.WhiteRabbit.Core.Models.SecurityEvent.Denied,
+        Reason = "unsupported_operation",
+        HttpStatus = StatusCodes.Status404NotFound,
+    });
+    return Results.Json(new { error = "unsupported_operation" }, statusCode: StatusCodes.Status404NotFound);
+}).AllowAnonymous().WithOrder(int.MaxValue);
+
 // --- Razor Pages ---
 app.MapRazorPages();
 
 // --- YARP (Dex + Bunny proxy) ---
-// The pipeline middleware enforces auth, OIDC client requirement, capability grants,
-// and credential injection for bunny routes before YARP forwards the request.
+// BunnyProxyGate enforces authentication (virtual credential or Dex token), the sign-in allow-list, capability
+// grants and server-side credential injection for bunny routes before YARP forwards the request.
+var bunnyGate = app.Services.GetRequiredService<BunnyProxyGate>();
 app.MapReverseProxy(proxyPipeline =>
 {
     proxyPipeline.Use(async (ctx, next) =>
@@ -311,99 +362,7 @@ app.MapReverseProxy(proxyPipeline =>
         var route = ctx.Features.Get<IReverseProxyFeature>()?.Route;
         if (route?.Config.RouteId.StartsWith("bunny.", StringComparison.Ordinal) == true)
         {
-            var metadata = route.Config.Metadata!;
-            var audit = ctx.RequestServices.GetRequiredService<IAuditService>();
-            var operationId = route.Config.RouteId["bunny.".Length..];
-
-            // 1. Require authentication
-            if (ctx.User.Identity?.IsAuthenticated != true)
-            {
-                ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                await audit.RecordAsync(operationId, null, null, "denied_unauthenticated", 401);
-                return;
-            }
-
-            // 2. The proxy is only accessible via OIDC client tokens issued to a configured
-            //    proxy client. azp (authorized party) wins; otherwise the token must have
-            //    exactly one audience. Cookie-session users have neither claim and are
-            //    redirected to use a registered OIDC client instead.
-            var clientId = OidcClientIdentity.Resolve(ctx.User, proxyClients.AllowedClientIds);
-            if (clientId is null)
-            {
-                ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
-                ctx.Response.ContentType = "application/json";
-                await ctx.Response.WriteAsync(
-                    """{"error":"proxy_requires_oidc","detail":"The proxy is only accessible via OIDC client tokens. Use a registered client application."}""");
-                await audit.RecordAsync(operationId, ctx.User.FindFirstValue(ClaimTypes.Email), null, "denied_no_oidc_client", 403);
-                return;
-            }
-
-            var email = ctx.User.FindFirstValue(ClaimTypes.Email);
-
-            // 3. The user must still be on the sign-in allow-list.
-            if (!signInPolicy.IsAllowed(email))
-            {
-                ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
-                ctx.Response.ContentType = "application/json";
-                await ctx.Response.WriteAsync("""{"error":"user_not_allowed"}""");
-                await audit.RecordAsync(operationId, email, clientId, "denied_user_not_allowed", 403);
-                return;
-            }
-
-            // 4. Capability check — every JWT client must have an explicit grant.
-            if (metadata["AuthOnly"] != "true")
-            {
-                var capability = metadata["Capability"];
-                var grants = ctx.RequestServices.GetRequiredService<IGrantService>();
-                var granted = await grants.GetGrantedCapabilitiesAsync(email ?? "", clientId);
-                if (!granted.Contains(capability))
-                {
-                    ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
-                    ctx.Response.ContentType = "application/json";
-                    await ctx.Response.WriteAsync(
-                        $$"""{"error":"capability_not_granted","required":"{{capability}}"}""");
-                    await audit.RecordAsync(operationId, email, clientId, "denied_capability", 403);
-                    return;
-                }
-            }
-
-            // 5. Inject the user's own bunny.net API key via Items so the transform
-            //    can add it to the proxy request after header copying.
-            if (metadata["CredentialKind"] == "AccountApiKey")
-            {
-                var users = ctx.RequestServices.GetRequiredService<IUserRepository>();
-                var user = email is not null ? await users.FindByEmailAsync(email) : null;
-                if (string.IsNullOrEmpty(user?.BunnyApiKey))
-                {
-                    ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
-                    ctx.Response.ContentType = "application/json";
-                    await ctx.Response.WriteAsync(
-                        """{"error":"bunny_api_key_not_configured","detail":"Go to /settings to add your bunny.net API key."}""");
-                    await audit.RecordAsync(operationId, email, clientId, "denied_no_api_key", 403);
-                    return;
-                }
-
-                // Decrypt the stored API key. If decryption fails the key was stored
-                // as plaintext before encryption was introduced — treat as missing.
-                string plaintextKey;
-                try
-                {
-                    plaintextKey = bunnyKeyProtector.Unprotect(user.BunnyApiKey);
-                }
-                catch (System.Security.Cryptography.CryptographicException)
-                {
-                    ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
-                    ctx.Response.ContentType = "application/json";
-                    await ctx.Response.WriteAsync(
-                        """{"error":"bunny_api_key_not_configured","detail":"Your API key needs to be re-entered. Go to /settings to update it."}""");
-                    await audit.RecordAsync(operationId, email, clientId, "denied_key_decryption_failed", 403);
-                    return;
-                }
-                ctx.Items["bunny.access-key"] = plaintextKey;
-            }
-
-            await next();
-            await audit.RecordAsync(operationId, email, clientId, "allowed", ctx.Response.StatusCode);
+            await bunnyGate.InvokeAsync(ctx, () => next(), route);
             return;
         }
 

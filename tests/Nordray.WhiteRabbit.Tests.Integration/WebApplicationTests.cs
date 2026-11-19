@@ -109,14 +109,24 @@ public partial class WebApplicationTests : IAsyncLifetime
     // --- Proxy: audience and client identity ---
 
     [Fact]
-    public async Task Proxy_TokenForConfiguredClient_ReachesTheCapabilityCheck() =>
+    public async Task Proxy_TokenForConfiguredClient_ReachesTheCapabilityCheck()
+    {
+        await EnsureUserAsync(WhiteRabbitFactory.AllowedEmail);
         await AssertProxy(WhiteRabbitFactory.Token(), HttpStatusCode.Forbidden, "capability_not_granted");
+    }
 
     [Fact]
-    public async Task Proxy_AzpOfConfiguredClient_IsAccepted() =>
+    public async Task Proxy_AzpOfConfiguredClient_IsAccepted()
+    {
+        await EnsureUserAsync(WhiteRabbitFactory.AllowedEmail);
         await AssertProxy(
             WhiteRabbitFactory.Token(audiences: [WhiteRabbitFactory.ProxyClient, "other"], azp: WhiteRabbitFactory.ProxyClient),
             HttpStatusCode.Forbidden, "capability_not_granted");
+    }
+
+    [Fact]
+    public async Task Proxy_TokenForUserWhoNeverSignedIn_IsForbidden() =>
+        await AssertProxy(WhiteRabbitFactory.Token(), HttpStatusCode.Forbidden, "user_not_allowed");
 
     [Fact]
     public async Task Proxy_TokenForAnotherAudience_IsUnauthorized() =>
@@ -229,6 +239,20 @@ public partial class WebApplicationTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
         var location = response.Headers.Location!;
         Assert.StartsWith("/login", location.IsAbsoluteUri ? location.AbsolutePath : location.OriginalString, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Starts the app (which migrates the database) and creates the user, as a real login would.</summary>
+    private async Task<long> EnsureUserAsync(string email)
+    {
+        await _factory.CreateHttpsClient().GetAsync("/health");
+        await using var connection = _db.Factory.Create();
+        var users = TestDatabase.Dao<Nordray.WhiteRabbit.Infrastructure.Database.IUserRepository>(connection);
+        if (await users.FindByEmailAsync(email) is null)
+            await users.InsertAsync(new Nordray.WhiteRabbit.Core.Models.User
+            {
+                Subject = "subject-" + email, Email = email, CreatedUtc = DateTime.UtcNow, LastLoginUtc = DateTime.UtcNow,
+            });
+        return (await users.FindByEmailAsync(email))!.Id;
     }
 
     private async Task AssertProxy(string token, HttpStatusCode expected, string? error = null, string path = "/proxy/api.bunny.net/statistics")

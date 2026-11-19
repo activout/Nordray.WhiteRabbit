@@ -7,7 +7,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Nordray.WhiteRabbit.Core.Access;
 using Nordray.WhiteRabbit.Core.Services;
-using Nordray.WhiteRabbit.Infrastructure.Audit;
 using Nordray.WhiteRabbit.Infrastructure.Database;
 using Nordray.WhiteRabbit.Infrastructure.Email;
 using Nordray.WhiteRabbit.Infrastructure.Encryption;
@@ -34,9 +33,12 @@ public static class InfrastructureServiceExtensions
         AddDao<IUserRepository>(services);
         AddDao<ILoginCodeRepository>(services);
         AddDao<IGrantDao>(services);
-        AddDao<IAuditDao>(services);
         AddDao<ICapabilityDao>(services);
         AddDao<IDataProtectionKeyDao>(services);
+        AddDao<IWorkloadBindingDao>(services);
+        AddDao<ICliSessionDao>(services);
+        AddDao<IVirtualCredentialDao>(services);
+        AddDao<ISecurityEventDao>(services);
 
         services.AddSingleton<DatabaseInitializer>();
 
@@ -65,9 +67,6 @@ public static class InfrastructureServiceExtensions
 
         // --- Grants ---
         services.AddScoped<IGrantService, GrantService>();
-
-        // --- Audit ---
-        services.AddScoped<IAuditService, AuditService>();
 
         return services;
     }
