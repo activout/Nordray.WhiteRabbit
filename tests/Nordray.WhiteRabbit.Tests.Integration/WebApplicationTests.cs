@@ -86,6 +86,26 @@ public partial class WebApplicationTests : IAsyncLifetime
         Assert.Equal(sent, _factory.Emails.Recipients.Contains(email));
     }
 
+    [Fact]
+    public async Task Login_RateLimitedAllowedAddress_AnswersLikeAnyOther()
+    {
+        var client = _factory.CreateHttpsClient();
+        var statuses = new List<string>();
+        for (var i = 0; i < 8; i++)
+        {
+            var form = await client.GetStringAsync("/login");
+            var response = await client.PostAsync("/login", new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["Email"] = WhiteRabbitFactory.AllowedEmail,
+                ["__RequestVerificationToken"] = AntiforgeryToken().Match(form).Groups[1].Value,
+            }));
+            statuses.Add($"{(int)response.StatusCode} {response.Headers.Location?.OriginalString.Split('?')[0]}");
+        }
+
+        Assert.All(statuses, s => Assert.Equal("302 /LoginVerify", s));
+        Assert.True(_factory.Emails.Recipients.Count < 8, "the per-address limit should have stopped some codes");
+    }
+
     // --- Proxy: audience and client identity ---
 
     [Fact]
@@ -171,10 +191,54 @@ public partial class WebApplicationTests : IAsyncLifetime
             .CreateProtector("BunnyApiKey.v1").Unprotect(protectedValue));
         await _factory.DisposeAsync();
 
-        // A different encryption key cannot read the key ring, so the value cannot be unprotected.
+        // A different (well-formed) encryption key cannot read the key ring: start-up refuses instead of serving
+        // traffic with every stored Bunny key unreadable.
         _factory = new WhiteRabbitFactory(_db.ConnectionString, KeyRingEncryptionTests.NewKey());
-        Assert.ThrowsAny<CryptographicException>(() => _factory.Services.GetRequiredService<IDataProtectionProvider>()
-            .CreateProtector("BunnyApiKey.v1").Unprotect(protectedValue));
+        var error = Assert.ThrowsAny<InvalidOperationException>(() => _factory.Services);
+        Assert.Contains("cannot decrypt the Data Protection key ring", error.Message);
+    }
+
+    [Fact]
+    public async Task Startup_RefusesStoredBunnyKeysWithoutAKeyRing()
+    {
+        await _factory.CreateHttpsClient().GetAsync("/health");
+        await _factory.DisposeAsync();
+        await using (var connection = _db.Factory.Create())
+        {
+            await connection.OpenAsync();
+            foreach (var sql in new[]
+            {
+                "INSERT INTO Users (Subject, Email, CreatedUtc, LastLoginUtc, BunnyApiKey) VALUES ('s', 'a@example.com', '2026-01-01 00:00:00.000', '2026-01-01 00:00:00.000', 'protected')",
+                "DELETE FROM DataProtectionKeys",
+            })
+            {
+                await using var command = connection.CreateCommand();
+                command.CommandText = sql;
+                await command.ExecuteNonQueryAsync();
+            }
+        }
+
+        _factory = new WhiteRabbitFactory(_db.ConnectionString, _encryptionKey);
+        var error = Assert.ThrowsAny<InvalidOperationException>(() => _factory.Services);
+        Assert.Contains("no Data Protection key ring", error.Message);
+    }
+
+    // --- Bearer tokens only on proxy routes ---
+
+    [Theory]
+    [InlineData("/settings")]
+    [InlineData("/auth?client_id=example-client&response_type=code&redirect_uri=http://127.0.0.1/cb")]
+    public async Task DexBearerToken_DoesNotSignInToUiOrDexRoutes(string path)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, path);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", WhiteRabbitFactory.Token());
+
+        var response = await _factory.CreateHttpsClient().SendAsync(request);
+
+        // Treated as signed out: sent to the login page rather than served or forwarded to Dex.
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        var location = response.Headers.Location!;
+        Assert.StartsWith("/login", location.IsAbsoluteUri ? location.AbsolutePath : location.OriginalString, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>Starts the app (which migrates the database) and creates the user, as a real login would.</summary>

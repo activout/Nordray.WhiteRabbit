@@ -32,6 +32,18 @@ public class SignInPolicyTests
     public void Domains_MatchTheWholeDomainOnly(string email, bool allowed) =>
         Assert.Equal(allowed, Policy(domains: ["@team.example"]).IsAllowed(email));
 
+    [Fact]
+    public void Update_TakesEffectImmediately()
+    {
+        var policy = Policy(emails: ["a@example.com"]);
+        Assert.True(policy.IsAllowed("a@example.com"));
+
+        policy.Update(new AccessOptions { AllowedEmails = ["b@example.com"] });
+
+        Assert.False(policy.IsAllowed("a@example.com"));
+        Assert.True(policy.IsAllowed("b@example.com"));
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("")]

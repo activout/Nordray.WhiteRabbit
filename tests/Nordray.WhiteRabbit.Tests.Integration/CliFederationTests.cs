@@ -416,7 +416,8 @@ public class CliFederationTests : IAsyncLifetime
     {
         var human = await HumanSessionAsync(grants: "statistics.read");
         var response = await SendAsync(HttpMethod.Get, "/proxy/api.bunny.net/statistics", human);
-        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        // Only Dex tokens are read from Authorization on proxy routes; a session token is not a credential there.
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
         Assert.Empty(_upstreamRequests);
     }
 
