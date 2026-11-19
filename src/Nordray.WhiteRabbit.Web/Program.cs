@@ -71,6 +71,7 @@ builder.Services.AddSingleton<IdentityTokenValidator>();
 builder.Services.AddScoped<CliPrincipalResolver>();
 builder.Services.AddScoped<SecurityAudit>();
 builder.Services.AddSingleton<BunnyProxyGate>();
+builder.Services.AddSingleton<ProxyRequestBodyPolicy>();
 builder.Services.AddHttpContextAccessor();
 
 // --- Authentication ---
@@ -208,6 +209,9 @@ var bunnyRoutes = bunnyRegistry.GetAll().Select(op => new RouteConfig
         ["Capability"]   = op.RequiredCapability ?? "",
         ["AuthOnly"]     = op.RequiresAuthenticationOnly ? "true" : "false",
         ["CredentialKind"] = op.CredentialKind.ToString(),
+        ["Redact"] = string.Join(';', op.RedactJsonFields),
+        [ProxyRequestBodyPolicy.RestoreMetadataKey] = op.RestoreRedactedEnvironmentFrom ?? "",
+        [ProxyRequestBodyPolicy.AllowedFieldsMetadataKey] = string.Join(';', op.AllowedBodyFields ?? []),
     },
 }).ToList();
 
@@ -265,6 +269,39 @@ builder.Services.AddReverseProxy()
                     transform.ProxyRequest.Headers.TryAddWithoutValidation("AccessKey", apiKey);
                 return ValueTask.CompletedTask;
             });
+
+            // Operations whose responses carry secrets the capability does not cover (e.g. environment variable
+            // values): the upstream body is read uncompressed, the listed fields replaced, and only then returned.
+            // A successful response that cannot be parsed is not passed through.
+            var redact = ctx.Route.Metadata?.GetValueOrDefault("Redact") is { Length: > 0 } fields
+                ? fields.Split(';', StringSplitOptions.RemoveEmptyEntries)
+                : [];
+            if (redact.Length > 0)
+            {
+                ctx.AddRequestHeaderRemove("Accept-Encoding");
+                ctx.AddResponseTransform(async transform =>
+                {
+                    if (transform.ProxyResponse is null || !transform.ProxyResponse.IsSuccessStatusCode)
+                        return;
+                    var body = await transform.ProxyResponse.Content.ReadAsStringAsync(transform.HttpContext.RequestAborted);
+                    var redacted = JsonRedaction.Redact(body, redact);
+                    var response = transform.HttpContext.Response;
+                    transform.SuppressResponseBody = true;
+                    response.Headers.Remove("Content-Encoding");
+                    if (redacted is null)
+                    {
+                        // Bunny answered; White Rabbit refuses to pass the answer on. The audit keeps both.
+                        transform.HttpContext.Items[ProxyRequestBodyPolicy.UpstreamStatusItem] = (int)transform.ProxyResponse.StatusCode;
+                        transform.HttpContext.Items[ProxyRequestBodyPolicy.LocalReasonItem] = "response_not_redactable";
+                        response.StatusCode = StatusCodes.Status502BadGateway;
+                        redacted = "{\"error\":\"response_not_redactable\"}";
+                    }
+                    var bytes = System.Text.Encoding.UTF8.GetBytes(redacted);
+                    response.ContentType = "application/json";
+                    response.ContentLength = bytes.Length;
+                    await response.Body.WriteAsync(bytes, transform.HttpContext.RequestAborted);
+                });
+            }
         }
     });
 
@@ -355,6 +392,7 @@ app.MapRazorPages();
 // BunnyProxyGate enforces authentication (virtual credential or Dex token), the sign-in allow-list, capability
 // grants and server-side credential injection for bunny routes before YARP forwards the request.
 var bunnyGate = app.Services.GetRequiredService<BunnyProxyGate>();
+var bodyPolicy = app.Services.GetRequiredService<ProxyRequestBodyPolicy>();
 app.MapReverseProxy(proxyPipeline =>
 {
     proxyPipeline.Use(async (ctx, next) =>
@@ -362,7 +400,9 @@ app.MapReverseProxy(proxyPipeline =>
         var route = ctx.Features.Get<IReverseProxyFeature>()?.Route;
         if (route?.Config.RouteId.StartsWith("bunny.", StringComparison.Ordinal) == true)
         {
-            await bunnyGate.InvokeAsync(ctx, () => next(), route);
+            // After the gate (which authorises and loads the owner's key): check the body's fields and restore
+            // redacted environment values.
+            await bunnyGate.InvokeAsync(ctx, () => bodyPolicy.InvokeAsync(ctx, route, () => next()), route);
             return;
         }
 

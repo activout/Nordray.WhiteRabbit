@@ -80,14 +80,19 @@ public sealed class BunnyProxyGate(
 
         await next();
 
-        // A forwarding failure (unreachable upstream, timeout) has no upstream status.
+        // A forwarding failure (unreachable upstream, timeout) has no upstream status. Neither has a request White
+        // Rabbit refused after authorising it (e.g. a body field that is not allowed). When White Rabbit replaced
+        // Bunny's answer (e.g. an unredactable body), Bunny's own status is kept next to the one the caller got.
         var forwardError = ctx.Features.Get<IForwarderErrorFeature>();
+        var localReason = ctx.Items[ProxyRequestBodyPolicy.LocalReasonItem] as string;
+        var upstreamStatus = ctx.Items[ProxyRequestBodyPolicy.UpstreamStatusItem] as int?;
+        if (forwardError is null && localReason is null) upstreamStatus = ctx.Response.StatusCode;
         await audit.RecordAsync(allowedEvent with
         {
             Outcome = SecurityEvent.Allowed,
             HttpStatus = ctx.Response.StatusCode,
-            UpstreamStatus = forwardError is null ? ctx.Response.StatusCode : null,
-            Reason = forwardError is null ? null : "upstream_" + forwardError.Error.ToString().ToLowerInvariant(),
+            UpstreamStatus = forwardError is null ? upstreamStatus : null,
+            Reason = forwardError is not null ? "upstream_" + forwardError.Error.ToString().ToLowerInvariant() : localReason,
         });
     }
 

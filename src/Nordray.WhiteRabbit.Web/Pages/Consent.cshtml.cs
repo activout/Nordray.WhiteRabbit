@@ -81,13 +81,9 @@ public sealed class ConsentModel(IGrantService grants, BunnyOperationRegistry re
 
         var allOps = registry.GetAll();
 
-        Capabilities = allOps
-            .Where(op => op.RequiredCapability is not null && scopes.Contains(op.RequiredCapability))
-            .GroupBy(op => op.RequiredCapability!)
-            .Select(g => new CapabilityViewModel(
-                g.Key,
-                g.First().ConsentTitle,
-                g.First().ConsentDescription))
+        Capabilities = registry.GetCapabilities()
+            .Where(c => scopes.Contains(c.Name))
+            .Select(c => new CapabilityViewModel(c.Name, c.Title, c.Description))
             .ToList();
 
         AuthOnlyOperations = allOps
