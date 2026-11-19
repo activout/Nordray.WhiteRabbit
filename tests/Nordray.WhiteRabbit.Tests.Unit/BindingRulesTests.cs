@@ -89,6 +89,37 @@ public class BindingRulesTests
         Assert.Equal("workflow_ref_mismatch", BindingRules.Match(
             GitHubIdentity() with { WorkflowRef = "acme/app/.github/workflows/deploy.yml@refs/heads/feature" }, [GitHubBinding()]).DenialReason);
 
+    private static WorkloadBinding AnyRefBinding() =>
+        GitHubBinding() with { Ref = "", WorkflowRef = "acme/app/.github/workflows/deploy.yml" };
+
+    [Theory]
+    [InlineData("refs/heads/main")]
+    [InlineData("refs/heads/feature")]
+    [InlineData("refs/tags/v1.2.3")]
+    public void BindingWithoutRef_MatchesAnyBranchOrTag(string reference) =>
+        Assert.Equal(1, BindingRules.Match(
+            GitHubIdentity() with { Ref = reference, WorkflowRef = "acme/app/.github/workflows/deploy.yml@" + reference }, [AnyRefBinding()]).Binding?.Id);
+
+    [Fact]
+    public void BindingWithoutRef_StillNeedsTheWorkflowAndTheRefRules()
+    {
+        Assert.Equal("no_matching_binding", BindingRules.Match(
+            GitHubIdentity() with { WorkflowRef = "acme/app/.github/workflows/other.yml@refs/heads/main" }, [AnyRefBinding()]).DenialReason);
+        Assert.Equal("workflow_ref_mismatch", BindingRules.Match(
+            GitHubIdentity() with { WorkflowRef = "acme/app/.github/workflows/deploy.yml@refs/heads/feature" }, [AnyRefBinding()]).DenialReason);
+        Assert.Equal("ref_not_allowed", BindingRules.Match(
+            GitHubIdentity() with { Ref = "refs/pull/1/merge", WorkflowRef = "acme/app/.github/workflows/deploy.yml@refs/pull/1/merge" }, [AnyRefBinding()]).DenialReason);
+    }
+
+    [Fact]
+    public void Validate_AcceptsABindingWithoutRef_OnlyWithAWorkflowPathWithoutRef()
+    {
+        Assert.Empty(BindingRules.Validate(AnyRefBinding(), IssuerKind.GitHub, Known));
+        Assert.NotEmpty(BindingRules.Validate(AnyRefBinding() with { WorkflowRef = "acme/app/.github/workflows/deploy.yml@refs/heads/main" }, IssuerKind.GitHub, Known));
+        Assert.NotEmpty(BindingRules.Validate(GitHubBinding() with { WorkflowRef = "acme/app/.github/workflows/deploy.yml" }, IssuerKind.GitHub, Known));
+        Assert.NotEmpty(BindingRules.Validate(AnyRefBinding() with { WorkflowRef = "acme/app/" }, IssuerKind.GitHub, Known));
+    }
+
     [Fact]
     public void TwoMatchingBindings_AreAmbiguous() =>
         Assert.Equal("ambiguous_binding", BindingRules.Match(GitHubIdentity(), [GitHubBinding(), GitHubBinding() with { Id = 2 }]).DenialReason);

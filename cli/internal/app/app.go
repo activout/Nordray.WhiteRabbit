@@ -511,7 +511,11 @@ func (a *App) bindings(ctx context.Context, sub string, args []string) (int, err
 		}
 		sort.Slice(list, func(i, j int) bool { return list[i].Id < list[j].Id })
 		for _, b := range list {
-			fmt.Fprintf(a.Stdout, "#%d %s %s %s\n    workflow: %s\n    events: %s  capabilities: %s\n", b.Id, b.Issuer, b.Repository, b.Ref,
+			ref := b.Ref
+			if ref == "" {
+				ref = "(any ref)"
+			}
+			fmt.Fprintf(a.Stdout, "#%d %s %s %s\n    workflow: %s\n    events: %s  capabilities: %s\n", b.Id, b.Issuer, b.Repository, ref,
 				b.WorkflowRef, strings.Join(b.Events, ","), strings.Join(b.Capabilities, ","))
 			if b.Environment != "" {
 				fmt.Fprintf(a.Stdout, "    environment: %s\n", b.Environment)
@@ -528,9 +532,9 @@ func (a *App) bindings(ctx context.Context, sub string, args []string) (int, err
 		fs.StringVar(&b.Repository, "repository", "", "owner/name (required)")
 		fs.StringVar(&b.RepositoryId, "repository-id", "", "GitHub numeric repository ID (required for GitHub)")
 		fs.StringVar(&b.RepositoryOwnerId, "repository-owner-id", "", "GitHub numeric owner ID (optional)")
-		fs.StringVar(&b.Ref, "ref", "", "exact ref, e.g. refs/heads/main (required)")
+		fs.StringVar(&b.Ref, "ref", "", "exact ref, e.g. refs/heads/main (optional: without it any branch or tag matches)")
 		fs.StringVar(&workflow, "workflow", "", "workflow file path, e.g. .github/workflows/deploy.yml (or use --workflow-ref)")
-		fs.StringVar(&b.WorkflowRef, "workflow-ref", "", "exact workflow_ref: <repository>/<path>@<ref>")
+		fs.StringVar(&b.WorkflowRef, "workflow-ref", "", "exact workflow_ref: <repository>/<path>@<ref>, or <repository>/<path> without --ref")
 		fs.StringVar(&b.JobWorkflowRef, "job-workflow-ref", "", "GitHub reusable workflow job_workflow_ref (optional)")
 		fs.StringVar(&b.Environment, "environment", "", "GitHub deployment environment (optional)")
 		fs.Var(&events, "event", "allowed event, repeatable (default: push and workflow_dispatch)")
@@ -540,14 +544,21 @@ func (a *App) bindings(ctx context.Context, sub string, args []string) (int, err
 			return 2, usageError{err.Error()}
 		}
 		if b.WorkflowRef == "" && workflow != "" {
-			b.WorkflowRef = b.Repository + "/" + strings.TrimPrefix(workflow, "/") + "@" + b.Ref
+			b.WorkflowRef = b.Repository + "/" + strings.TrimPrefix(workflow, "/")
+			if b.Ref != "" {
+				b.WorkflowRef += "@" + b.Ref
+			}
 		}
 		b.Events, b.Capabilities = events, caps
 		created, err := client.CreateBinding(ctx, token, b)
 		if err != nil {
 			return 1, err
 		}
-		fmt.Fprintf(a.Stdout, "Created binding #%d for %s %s (%s).\n", created.Id, created.Repository, created.Ref, created.WorkflowRef)
+		ref := created.Ref
+		if ref == "" {
+			ref = "(any ref)"
+		}
+		fmt.Fprintf(a.Stdout, "Created binding #%d for %s %s (%s).\n", created.Id, created.Repository, ref, created.WorkflowRef)
 		return 0, nil
 	case "rm", "remove", "revoke":
 		if len(args) != 1 {
