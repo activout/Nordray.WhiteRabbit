@@ -8,6 +8,9 @@ public interface IUserRepository
     [SqlQuery("SELECT * FROM Users WHERE Email = @email LIMIT 1")]
     Task<User?> FindByEmailAsync([Bind("email")] string email);
 
+    [SqlQuery("SELECT * FROM Users WHERE Id = @id")]
+    Task<User?> FindByIdAsync([Bind("id")] long id);
+
     [SqlQuery("SELECT * FROM Users WHERE Subject = @subject LIMIT 1")]
     Task<User?> FindBySubjectAsync([Bind("subject")] string subject);
 

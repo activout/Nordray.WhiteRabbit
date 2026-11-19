@@ -52,10 +52,20 @@ public sealed class DatabaseMigrator(DbConnection connection, ILogger<DatabaseMi
         return Embedded.Select(m => m.Version).Where(v => !applied.Contains(v)).ToList();
     }
 
+    /// <summary>
+    /// Splits a migration into statements. <c>--</c> comments, whole-line or trailing, are removed first, so a
+    /// comment may contain semicolons. Migrations must therefore not contain <c>--</c> or <c>;</c> inside string literals.
+    /// </summary>
     internal static IEnumerable<string> SplitStatements(string sql) =>
-        string.Join('\n', sql.Split('\n').Where(line => !line.TrimStart().StartsWith("--", StringComparison.Ordinal)))
+        string.Join('\n', sql.Split('\n').Select(StripComment))
             .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(s => s.Length > 0);
+
+    private static string StripComment(string line)
+    {
+        var comment = line.IndexOf("--", StringComparison.Ordinal);
+        return (comment < 0 ? line : line[..comment]).TrimEnd();
+    }
 
     private async Task<HashSet<int>> AppliedVersionsAsync(CancellationToken ct)
     {

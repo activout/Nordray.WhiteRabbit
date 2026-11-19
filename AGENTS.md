@@ -221,11 +221,17 @@ Requirements:
 ### login_codes
 `Id`, `Email`, `CodeHash`, `CreatedUtc`, `ExpiresUtc`, `ConsumedUtc`, `RequestIp`
 
-### audit_events
-`Id`, `OccurredUtc`, `UserId`, `ClientId`, `OperationId`, `RequestMethod`, `RequestPath`, `DestinationHost`, `DestinationPath`, `Outcome`, `HttpStatusCode`, `ErrorCode`
-
 ### DataProtectionKeys
 `FriendlyName`, `Xml` (AES-256-GCM encrypted with `DataProtection:EncryptionKey`), `CreatedUtc`
+
+### WorkloadBindings
+`Id`, `OwnerUserId`, `Issuer`, `Repository`, `RepositoryId`, `RepositoryOwnerId`, `Ref`, `WorkflowRef`, `JobWorkflowRef`, `Environment`, `EventNames`, `Capabilities`, `Description`, `CreatedUtc`, `RevokedUtc`
+
+### CliSessions / VirtualCredentials
+Opaque tokens stored as SHA-256 hashes only (`TokenHash`, `KeyHash`), with principal, owner, binding, lifetime and revocation.
+
+### SecurityEvents
+Append-only audit trail; never holds tokens, keys, codes, query strings or bodies. Replaces the earlier `AuditEvents` table.
 
 ### SchemaMigrations
 `Version`, `Name`, `AppliedUtc`
@@ -268,6 +274,12 @@ GET  /consent
 POST /consent/approve
 POST /consent/deny
 ANY  /proxy/{apiFamily}/{**path}
+POST /api/cli/exchange          Dex/GitHub/Forgejo identity token -> White Rabbit session (wrs_…)
+POST /api/cli/credentials       session -> virtual Bunny credential (wrk_…), proxy only
+GET  /api/cli/whoami            session -> principal and current capabilities
+POST /api/cli/revoke            revoke a credential, or the session and its credentials
+GET|POST /api/admin/bindings    human session only: list/create own workload bindings
+DELETE /api/admin/bindings/{id} human session only: revoke own binding
 GET  /health   process liveness
 GET  /ready    database reachable and all migrations applied (503 otherwise)
 ```
@@ -344,7 +356,7 @@ export the variables in your shell or use a tool like `dotenv`.
 - Denied proxy request (no capability) — 403 returned
 - Unsupported route — 404 returned
 - Unauthenticated request — 401 returned
-- Audit event creation — audit_events row written for every proxy decision
+- Audit event creation — SecurityEvents row written for every proxy decision, exchange, credential and admin change
 
 ---
 
@@ -360,7 +372,7 @@ These are mandatory and must not be weakened:
 6. Store only hashed login codes
 7. Strip dangerous headers (`AccessKey`, `Authorization`, `X-Remote-*`)
 8. Validate redirect and callback URIs carefully
-9. Log all security-relevant events in audit_events
+9. Log all security-relevant events in SecurityEvents
 10. Never auto-proxy a newly discovered bunny endpoint
 
 Additional protections:

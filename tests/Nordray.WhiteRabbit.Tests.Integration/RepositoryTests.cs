@@ -1,6 +1,5 @@
 using Nordray.WhiteRabbit.Bunny;
 using Nordray.WhiteRabbit.Core.Models;
-using Nordray.WhiteRabbit.Infrastructure.Audit;
 using Nordray.WhiteRabbit.Infrastructure.Database;
 using Nordray.WhiteRabbit.Infrastructure.Grants;
 using Nordray.WhiteRabbit.Proxy;
@@ -116,15 +115,24 @@ public class RepositoryTests
     }
 
     [Fact]
-    public async Task Audit_RecordsEvent()
+    public async Task SecurityEvents_RecordsEvent()
     {
         await using var db = await TestDatabase.CreateAsync();
         await using var connection = db.Factory.Create();
-        await new AuditService(TestDatabase.Dao<IAuditDao>(connection)).RecordAsync("core.statistics.get", "a@example.com", "example-client", "allowed", 200);
+        await TestDatabase.Dao<ISecurityEventDao>(connection).InsertAsync(new SecurityEvent
+        {
+            OccurredUtc = Now,
+            EventType = "proxy.request",
+            Outcome = SecurityEvent.Allowed,
+            OperationId = "core.statistics.get",
+            ClientId = "example-client",
+            HttpStatus = 200,
+            UpstreamStatus = 200,
+        });
 
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT ClientId || '|' || OperationId || '|' || Outcome || '|' || HttpStatusCode FROM AuditEvents";
-        Assert.Equal("a@example.com/example-client|core.statistics.get|allowed|200", await command.ExecuteScalarAsync());
+        command.CommandText = "SELECT EventType || '|' || Outcome || '|' || OperationId || '|' || ClientId || '|' || HttpStatus || '|' || UpstreamStatus FROM SecurityEvents";
+        Assert.Equal("proxy.request|allowed|core.statistics.get|example-client|200|200", await command.ExecuteScalarAsync());
     }
 
     [Fact]

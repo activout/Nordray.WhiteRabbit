@@ -25,7 +25,8 @@ connectors:
       # Optional: also forward groups or email via a header if needed later.
 
 oauth2:
-  # Only allow response_type=code (confidential clients only).
+  # Only allow response_type=code. Public clients (rabbit-cli) must add PKCE S256; White Rabbit enforces that
+  # in front of /auth because Dex itself accepts public-client logins without PKCE.
   responseTypes:
     - code
   # White Rabbit handles consent before the request reaches Dex, so Dex's
@@ -39,6 +40,12 @@ staticClients:
     # White Rabbit itself is a client of Dex for its consent/session flow.
     redirectURIs:
       - http://localhost:8080/auth/callback
+
+  # The rabbit CLI: a public client (no secret is shipped in the binary). Dex allows any http://127.0.0.1:<port>
+  # and http://localhost:<port> redirect for public clients, which the CLI's loopback login uses.
+  - id: rabbit-cli
+    name: rabbit CLI
+    public: true
 
   - id: example-client
     secret: $DEX_EXAMPLE_CLIENT_SECRET

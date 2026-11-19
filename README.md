@@ -119,6 +119,44 @@ Non-secret settings that every instance must choose:
 
 See [`.env.example`](.env.example) for a full template.
 
+### rabbit CLI and CI federation
+
+The `rabbit` CLI never holds a real bunny.net key. It exchanges an identity token for a White Rabbit session, then
+asks for short-lived **virtual credentials** that only White Rabbit's proxy accepts.
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /api/cli/exchange` `{"subject_token": "…"}` | none (rate limited) | Exchanges a Dex ID token (client `rabbit-cli`, at most 10 minutes old), a GitHub Actions token or a Forgejo Actions token for a session token `wrs_…`. Humans get 8 hours, CI workloads 60 minutes |
+| `POST /api/cli/credentials` `{"capabilities": […]}` | `Authorization: Bearer wrs_…` | Issues a virtual credential `wrk_…` (5 minutes), never broader than the session. Send it as `AccessKey` to `/proxy/api.bunny.net/…` |
+| `GET /api/cli/whoami` | session | The authenticated human or workload and its current capabilities |
+| `POST /api/cli/revoke` `{"credential_id": "…"?}` | session | Revokes one credential, or the session and all its credentials |
+| `GET/POST /api/admin/bindings`, `DELETE /api/admin/bindings/{id}` | human session only | Lists, creates and revokes the caller's own CI workload bindings |
+
+- **Sessions and virtual credentials** are opaque random tokens; only their SHA-256 hashes are stored. They are checked on every use against the sign-in allow-list, the human's current grants for `rabbit-cli`, or the workload binding, so revoking any of those takes effect immediately.
+- **The proxy** accepts a virtual credential in `AccessKey`, or a Dex token issued to a client in `Proxy:AllowedClientIds`. Anything else in `AccessKey`, including a real bunny.net key, is refused and never forwarded. The owner's own stored key is injected server side.
+- **CI tokens** are validated per configured issuer: exact `iss`, audience `Federation:Audience`, RS256 only (checked before any key lookup), expiry and not-before, and a lifetime of at most `Federation:MaxTokenLifetime`. Signing keys come from the issuer's discovery document; only configured issuers are ever fetched.
+- **Workload bindings** decide what a CI identity may do. They are created only through the admin API by a human, never from repository content.
+  - Every field is matched exactly: issuer, repository, ref (`refs/heads/…` or `refs/tags/…` only) and `workflow_ref`, whose `@ref` must equal the ref.
+  - The event must be on the binding's allow-list. `pull_request`, `pull_request_target`, `workflow_run` and similar events are never allowed.
+  - **GitHub** bindings also require the immutable `repository_id`, and optionally `repository_owner_id`, `environment` and `job_workflow_ref`.
+  - **Forgejo** (tested on 15.0.12) does not issue IDs or environments. Its bindings match on names, so renaming or transferring a repository is a known risk. Forgejo's `ref_protected` claim is always `"false"` and is not used. Forgejo jobs must set `enable-openid-connect: true`.
+  - Two matching bindings are refused as ambiguous.
+- **Dex**: `rabbit-cli` is a public client (no secret in the binary). White Rabbit rejects its authorization requests unless they use `response_type=code` with PKCE `S256`, because Dex itself accepts public-client logins without PKCE.
+
+Settings: `Cli:DexClientId`, `Cli:*Lifetime`, `Cli:MaxDexTokenAge`, `Federation:Audience` (distinct per environment, e.g. `whiterabbit:test`), `Federation:MaxTokenLifetime`, and `Federation:Issuers` (each `Name`, `Kind` = `GitHub` or `Forgejo`, and the exact `Url`). An empty audience or issuer list disables CI federation.
+
+### Audit
+
+Security events (`SecurityEvents` table and the structured log) record token exchanges, credential issuance, revocations, binding changes and every proxy decision. Each event records:
+- principal type, subject and issuer;
+- binding and session;
+- repository, workflow, ref and run;
+- credential ID;
+- operation, method and path (never the query string);
+- status, upstream status and correlation ID.
+
+Tokens, keys, codes and request bodies are never recorded. Send `X-Correlation-ID` to correlate a request; it is echoed in the response.
+
 ### Health
 
 - `GET /health`: the process is running.
