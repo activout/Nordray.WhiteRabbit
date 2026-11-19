@@ -34,6 +34,7 @@ public static class CliEndpoints
     public static void MapCliEndpoints(this WebApplication app)
     {
         var cli = app.MapGroup("/api/cli");
+        cli.MapGet("/config", Config).RequireRateLimiting(ApiRateLimit).AllowAnonymous();
         cli.MapPost("/exchange", Exchange).RequireRateLimiting(ExchangeRateLimit).AllowAnonymous();
         cli.MapPost("/credentials", IssueCredential).RequireAuthorization(SessionPolicy).RequireRateLimiting(ApiRateLimit);
         cli.MapGet("/whoami", WhoAmI).RequireAuthorization(SessionPolicy).RequireRateLimiting(ApiRateLimit);
@@ -44,6 +45,29 @@ public static class CliEndpoints
         admin.MapPost("/", CreateBinding);
         admin.MapDelete("/{id:long}", RevokeBinding);
     }
+
+    // ---------------------------------------------------------------- discovery
+
+    /// <summary>
+    /// What the rabbit CLI needs to know about this instance, so it only has to be told the server URL: the public
+    /// Dex client to sign in with, the audience CI tokens must be requested for (empty when CI federation is off),
+    /// and the capabilities it can ask for at sign-in. Nothing here is secret.
+    /// </summary>
+    private static IResult Config(IOptions<CliOptions> cli, IOptions<FederationOptions> federation, BunnyOperationRegistry registry) =>
+        Results.Json(new
+        {
+            DexClientId = cli.Value.DexClientId,
+            FederationAudience = federation.Value.Issuers.Count > 0 ? federation.Value.Audience : "",
+            Capabilities = registry.GetAll()
+                .Where(op => op.RequiredCapability is not null)
+                .GroupBy(op => op.RequiredCapability!)
+                .OrderBy(g => g.Key, StringComparer.Ordinal)
+                .Select(g =>
+                {
+                    var op = g.OrderBy(o => o.OperationId, StringComparer.Ordinal).First();
+                    return new { Name = g.Key, Title = op.ConsentTitle, Description = op.ConsentDescription };
+                }),
+        }, Json);
 
     // ---------------------------------------------------------------- exchange
 

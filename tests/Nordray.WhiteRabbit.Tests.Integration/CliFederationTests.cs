@@ -47,6 +47,17 @@ public class CliFederationTests : IAsyncLifetime
         await _db.DisposeAsync();
     }
 
+    // ================================================================ discovery
+
+    [Fact]
+    public async Task Config_TellsTheCliItsClientAudienceAndCapabilities()
+    {
+        var config = await _client.GetFromJsonAsync<JsonElement>("/api/cli/config");
+        Assert.Equal(WhiteRabbitFactory.CliClient, config.GetProperty("dex_client_id").GetString());
+        Assert.Equal(WhiteRabbitFactory.FederationAudience, config.GetProperty("federation_audience").GetString());
+        Assert.Contains(config.GetProperty("capabilities").EnumerateArray(), c => c.GetProperty("name").GetString() == "statistics.read");
+    }
+
     // ================================================================ human (Dex) exchange
 
     [Fact]

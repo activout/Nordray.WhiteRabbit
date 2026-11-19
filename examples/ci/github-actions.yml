@@ -1,0 +1,31 @@
+# Runs BunnyCLI through White Rabbit from GitHub Actions, with no bunny.net or White Rabbit secret in the repository.
+# Prerequisite: a human ran, once,
+#   rabbit admin bindings add --issuer github --repository <owner>/<repo> --repository-id <numeric id> \
+#     --ref refs/heads/main --workflow .github/workflows/bunny.yml --capability pullzone.read
+name: bunny through White Rabbit
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # lets rabbit request this job's own OIDC token
+
+env:
+  RABBIT_SERVER: https://whiterabbit.example.com
+  RABBIT_VERSION: v0.1.0
+
+jobs:
+  bunny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install BunnyCLI and rabbit
+        run: |
+          npm install -g @bunny.net/cli@0.22.0
+          curl -fsSL "https://raw.githubusercontent.com/activout/Nordray.WhiteRabbit/$RABBIT_VERSION/scripts/install-rabbit.sh" | sh -s -- "$RABBIT_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: rabbit auth whoami
+      - run: rabbit -- api GET /pullzone

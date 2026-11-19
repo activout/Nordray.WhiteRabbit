@@ -1,0 +1,30 @@
+# Runs BunnyCLI through White Rabbit from Forgejo Actions (tested with Forgejo 15.0.12, runner 12.10.2).
+# Put it in .forgejo/workflows/. Prerequisite: a human ran, once,
+#   rabbit admin bindings add --issuer <forgejo issuer name> --repository <owner>/<repo> \
+#     --ref refs/heads/main --workflow .forgejo/workflows/bunny.yml --capability pullzone.read
+name: bunny through White Rabbit
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  RABBIT_SERVER: https://whiterabbit.example.com
+  RABBIT_VERSION: v0.1.0
+
+jobs:
+  bunny:
+    runs-on: ubuntu-latest
+    # Forgejo hands out an OIDC token only with this; `permissions: id-token: write` has no effect on Forgejo.
+    enable-openid-connect: true
+    steps:
+      # Forgejo resolves actions from its own mirror; pin this to a reviewed commit SHA from that mirror in production.
+      - uses: actions/checkout@v4
+      - name: Install BunnyCLI and rabbit
+        run: |
+          npm install -g @bunny.net/cli@0.22.0
+          curl -fsSL "https://raw.githubusercontent.com/activout/Nordray.WhiteRabbit/$RABBIT_VERSION/scripts/install-rabbit.sh" | sh -s -- "$RABBIT_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: rabbit auth whoami
+      - run: rabbit -- api GET /pullzone

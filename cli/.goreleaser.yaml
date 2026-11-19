@@ -1,0 +1,43 @@
+# Release of the rabbit CLI. Run by .github/workflows/cli.yml on a vX.Y.Z tag.
+version: 2
+project_name: nordray-rabbit
+
+before:
+  hooks:
+    - go mod verify
+
+builds:
+  - id: rabbit
+    main: ./cmd/rabbit
+    binary: rabbit
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X github.com/activout/nordray.whiterabbit/cli/internal/app.Version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: rabbit
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "nordray-rabbit_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+
+checksum:
+  name_template: SHA256SUMS
+  algorithm: sha256
+
+changelog:
+  disable: true
+
+release:
+  github:
+    owner: activout
+    name: Nordray.WhiteRabbit
+  name_template: "rabbit {{ .Version }}"
