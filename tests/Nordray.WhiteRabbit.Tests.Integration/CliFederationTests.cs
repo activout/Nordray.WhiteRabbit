@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.IdentityModel.Tokens;
@@ -27,6 +28,11 @@ public class CliFederationTests : IAsyncLifetime
     private WhiteRabbitFactory _factory = null!;
     private HttpClient _client = null!;
     private readonly List<HttpRequestMessage> _upstreamRequests = [];
+    private readonly List<string> _upstreamBodies = [];
+
+    /// <summary>What the fake api.bunny.net answers; tests replace it.</summary>
+    private Func<HttpRequestMessage, HttpResponseMessage> _upstream =
+        _ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("""{"ok":true}""") };
 
     public async Task InitializeAsync()
     {
@@ -34,8 +40,13 @@ public class CliFederationTests : IAsyncLifetime
         _factory = new WhiteRabbitFactory(_db.ConnectionString, KeyRingEncryptionTests.NewKey());
         _factory.Upstream.When("https://api.bunny.net/*").Respond(request =>
         {
-            lock (_upstreamRequests) _upstreamRequests.Add(request);
-            return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("""{"ok":true}""") };
+            var body = request.Content?.ReadAsStringAsync().GetAwaiter().GetResult() ?? "";
+            lock (_upstreamRequests)
+            {
+                _upstreamRequests.Add(request);
+                _upstreamBodies.Add(body);
+            }
+            return _upstream(request);
         });
         _client = _factory.CreateHttpsClient();
         await _client.GetAsync("/health"); // starts the app and applies migrations
@@ -56,6 +67,16 @@ public class CliFederationTests : IAsyncLifetime
         Assert.Equal(WhiteRabbitFactory.CliClient, config.GetProperty("dex_client_id").GetString());
         Assert.Equal(WhiteRabbitFactory.FederationAudience, config.GetProperty("federation_audience").GetString());
         Assert.Contains(config.GetProperty("capabilities").EnumerateArray(), c => c.GetProperty("name").GetString() == "statistics.read");
+    }
+
+    [Fact]
+    public async Task Config_DescribesEachCapabilityAsAWhole()
+    {
+        var config = await _client.GetFromJsonAsync<JsonElement>("/api/cli/config");
+        var mcRead = config.GetProperty("capabilities").EnumerateArray().Single(c => c.GetProperty("name").GetString() == "mc.read");
+        var description = mcRead.GetProperty("description").GetString()!;
+        Assert.Contains("registries", description);
+        Assert.Contains("redacted", description);
     }
 
     // ================================================================ human (Dex) exchange
@@ -501,6 +522,271 @@ public class CliFederationTests : IAsyncLifetime
         var response = await ProxyAsync(key, "/proxy/api.bunny.net/statistics");
         Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
         Assert.Contains("user_not_allowed", await response.Content.ReadAsStringAsync());
+    }
+
+    // ================================================================ Magic Containers and Bunny Database (Phase 6)
+
+    private const string AppWithSecrets = """
+        {"id":"app-1","name":"nordray-access-test","containerTemplates":[
+          {"id":"c-api","name":"api","image":"codebahn.net/activout/nordray-access:abc",
+           "environmentVariables":[{"name":"NORDRAY_VAULT_STORAGE_PASSWORD","value":"vault-secret-1"},{"name":"MODE","value":"prod"}]},
+          {"id":"c-dex","name":"dex","environmentVariables":[{"name":"DEX_CLIENT_SECRET","value":"dex-secret-2"}]}]}
+        """;
+
+    private static HttpResponseMessage Json(string body, HttpStatusCode status = HttpStatusCode.OK) =>
+        new(status) { Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json") };
+
+    [Fact]
+    public async Task McAppGet_RedactsEnvironmentValuesButKeepsIds()
+    {
+        _upstream = _ => Json(AppWithSecrets);
+        var key = await CredentialAsync(await HumanSessionAsync(grants: "mc.read"));
+
+        var response = await ProxyAsync(key, "/proxy/api.bunny.net/mc/apps/app-1");
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("https://api.bunny.net/mc/apps/app-1", Assert.Single(_upstreamRequests).RequestUri!.ToString());
+        Assert.False(_upstreamRequests[0].Headers.Contains("Accept-Encoding"), "redacted routes read the upstream body uncompressed");
+        Assert.DoesNotContain("vault-secret-1", body);
+        Assert.DoesNotContain("dex-secret-2", body);
+        Assert.DoesNotContain("\"prod\"", body);
+        var app = JsonDocument.Parse(body).RootElement;
+        Assert.Equal("c-api", app.GetProperty("containerTemplates")[0].GetProperty("id").GetString());
+        Assert.Equal("NORDRAY_VAULT_STORAGE_PASSWORD", app.GetProperty("containerTemplates")[0].GetProperty("environmentVariables")[0].GetProperty("name").GetString());
+        Assert.Equal("[redacted by White Rabbit]", app.GetProperty("containerTemplates")[0].GetProperty("environmentVariables")[0].GetProperty("value").GetString());
+    }
+
+    [Fact]
+    public async Task McRegistryList_RedactsPasswordFragments()
+    {
+        _upstream = _ => Json("""{"items":[{"id":7,"hostName":"codebahn.net","isPublic":false,"firstPasswordSymbols":"ab","lastPasswordSymbols":"yz"}]}""");
+        var key = await CredentialAsync(await HumanSessionAsync(grants: "mc.read"));
+
+        var body = await (await ProxyAsync(key, "/proxy/api.bunny.net/mc/registries")).Content.ReadAsStringAsync();
+
+        var item = JsonDocument.Parse(body).RootElement.GetProperty("items")[0];
+        Assert.Equal(7, item.GetProperty("id").GetInt32());
+        Assert.Equal("[redacted by White Rabbit]", item.GetProperty("firstPasswordSymbols").GetString());
+        Assert.Equal("[redacted by White Rabbit]", item.GetProperty("lastPasswordSymbols").GetString());
+    }
+
+    [Fact]
+    public async Task McDeploy_RequiresMcDeploy_ForwardsTheBody_AndRedactsTheAnswer()
+    {
+        _upstream = _ => Json("""{"id":"c-api","image":"new","environmentVariables":[{"name":"X","value":"secret-3"}]}""");
+        var readOnly = await CredentialAsync(await HumanSessionAsync(grants: "mc.read"));
+        var patch = """{"image":"codebahn.net/activout/nordray-access:def"}""";
+
+        Assert.Equal(HttpStatusCode.Forbidden, (await SendWithKeyAsync(HttpMethod.Patch, "/proxy/api.bunny.net/mc/apps/app-1/containers/c-api", readOnly, patch)).StatusCode);
+        Assert.Empty(_upstreamRequests);
+
+        await GrantAsync(Email, WhiteRabbitFactory.CliClient, "mc.read", "mc.deploy");
+        var deployer = await CredentialAsync((await ExchangeAsync(DexToken(Email))).Body.GetProperty("access_token").GetString()!);
+        var response = await SendWithKeyAsync(HttpMethod.Patch, "/proxy/api.bunny.net/mc/apps/app-1/containers/c-api", deployer, patch);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(patch, Assert.Single(_upstreamBodies));
+        Assert.DoesNotContain("secret-3", await response.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task McRedactedRoute_UnparsableSuccess_IsNotPassedThrough()
+    {
+        _upstream = _ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("NORDRAY_VAULT_STORAGE_PASSWORD=vault-secret-1") };
+        var key = await CredentialAsync(await HumanSessionAsync(grants: "mc.read"));
+
+        var response = await ProxyAsync(key, "/proxy/api.bunny.net/mc/apps/app-1");
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.DoesNotContain("vault-secret-1", await response.Content.ReadAsStringAsync());
+        // Bunny succeeded; the audit says so, and why White Rabbit refused the answer.
+        var audit = (await SecurityEventsAsync()).Last(e => (string?)e["EventType"] == "proxy.request");
+        Assert.Equal(502L, audit["HttpStatus"]);
+        Assert.Equal(200L, audit["UpstreamStatus"]);
+        Assert.Equal("response_not_redactable", (string?)audit["Reason"]);
+    }
+
+    [Theory]
+    [InlineData("""{"imageTag":"def","environmentVariables":[{"name":"X","value":"y"}]}""", "environmentVariables")]
+    [InlineData("""{"environmentVariables":[]}""", "environmentVariables")]
+    [InlineData("""{"EnvironmentVariables":null}""", "EnvironmentVariables")]
+    [InlineData("""{"imageTag":"def","endpoints":[]}""", "endpoints")]
+    [InlineData("""{"volumeMounts":[{"name":"v","mountPath":"/"}]}""", "volumeMounts")]
+    [InlineData("""{"entryPoint":{"command":"sh"}}""", "entryPoint")]
+    public async Task McDeploy_CanChangeOnlyTheImage(string patch, string refusedField)
+    {
+        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.deploy", "mc.env"]));
+
+        var response = await SendWithKeyAsync(HttpMethod.Patch, "/proxy/api.bunny.net/mc/apps/app-1/containers/c-api", key, patch);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement;
+        Assert.Equal("body_field_not_allowed", body.GetProperty("error").GetString());
+        Assert.Contains(body.GetProperty("fields").EnumerateArray(), f => f.GetString() == refusedField);
+        Assert.Empty(_upstreamRequests);
+        var audit = (await SecurityEventsAsync()).Last(e => (string?)e["EventType"] == "proxy.request");
+        Assert.Equal("body_field_not_allowed", (string?)audit["Reason"]);
+        Assert.Null(audit["UpstreamStatus"]);
+    }
+
+    [Fact]
+    public async Task McDeploy_ImageFieldsAreForwarded_InAnyCase()
+    {
+        _upstream = _ => Json("""{"id":"c-api"}""");
+        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.deploy"]));
+        var patch = """{"ImageTag":"def","imageRegistryId":"reg-1","imageNamespace":"activout","imageName":"x","imagePullPolicy":"Always"}""";
+
+        var response = await SendWithKeyAsync(HttpMethod.Patch, "/proxy/api.bunny.net/mc/apps/app-1/containers/c-api", key, patch);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(JsonNode.Parse(patch)!.ToJsonString(), JsonNode.Parse(Assert.Single(_upstreamBodies))!.ToJsonString());
+    }
+
+    private const string EnvPath = "/proxy/api.bunny.net/mc/apps/app-1/containers/c-api/env";
+
+    /// <summary>Upstream with one container holding two secrets; PUT env echoes the stored variables back.</summary>
+    private void ContainerWithSecretsUpstream() => _upstream = request =>
+        request.Method == HttpMethod.Get
+            ? Json("""{"id":"c-api","environmentVariables":[{"name":"DB_TOKEN","value":"db-secret-1"},{"name":"MODE","value":"test"}]}""")
+            : Json("""{"id":"c-api","environmentVariables":[{"name":"DB_TOKEN","value":"db-secret-1"},{"name":"MODE","value":"prod"},{"name":"NEW","value":"new-secret-2"}]}""");
+
+    [Fact]
+    public async Task EnvSet_PlaceholdersKeepTheirCurrentValues_AndTheAnswerIsRedacted()
+    {
+        ContainerWithSecretsUpstream();
+        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.read", "mc.env"]));
+
+        // What `bunny apps env set NEW …` sends after reading the (redacted) container through White Rabbit.
+        var response = await SendWithKeyAsync(HttpMethod.Put, EnvPath, key,
+            """{"DB_TOKEN":"[redacted by White Rabbit]","MODE":"prod","NEW":"new-secret-2"}""");
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(2, _upstreamRequests.Count);
+        Assert.Equal(HttpMethod.Get, _upstreamRequests[0].Method);
+        Assert.Equal("https://api.bunny.net/mc/apps/app-1/containers/c-api", _upstreamRequests[0].RequestUri!.ToString());
+        Assert.Equal(HttpMethod.Put, _upstreamRequests[1].Method);
+        Assert.Equal("https://api.bunny.net/mc/apps/app-1/containers/c-api/env", _upstreamRequests[1].RequestUri!.ToString());
+        var sent = JsonDocument.Parse(_upstreamBodies[1]).RootElement;
+        Assert.Equal("db-secret-1", sent.GetProperty("DB_TOKEN").GetString());
+        Assert.Equal("prod", sent.GetProperty("MODE").GetString());
+        Assert.Equal("new-secret-2", sent.GetProperty("NEW").GetString());
+        Assert.DoesNotContain("db-secret-1", body);
+        Assert.DoesNotContain("new-secret-2", body);
+    }
+
+    [Fact]
+    public async Task EnvSet_WithoutPlaceholders_IsForwardedUnchanged_WithoutReadingFirst()
+    {
+        ContainerWithSecretsUpstream();
+        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.env"]));
+        var env = """{"MODE":"prod"}""";
+
+        Assert.Equal(HttpStatusCode.OK, (await SendWithKeyAsync(HttpMethod.Put, EnvPath, key, env)).StatusCode);
+
+        Assert.Equal(HttpMethod.Put, Assert.Single(_upstreamRequests).Method);
+        Assert.Equal(env, JsonNode.Parse(_upstreamBodies[0])!.ToJsonString());
+    }
+
+    [Fact]
+    public async Task EnvSet_PlaceholderForAnUnknownVariable_IsRefused()
+    {
+        ContainerWithSecretsUpstream();
+        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.env"]));
+
+        var response = await SendWithKeyAsync(HttpMethod.Put, EnvPath, key, """{"OTHER":"[redacted by White Rabbit]"}""");
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains("redacted_value_unknown", await response.Content.ReadAsStringAsync());
+        Assert.Equal(HttpMethod.Get, Assert.Single(_upstreamRequests).Method);
+        var audit = (await SecurityEventsAsync()).Last(e => (string?)e["EventType"] == "proxy.request");
+        Assert.Equal("redacted_value_unknown", (string?)audit["Reason"]);
+        Assert.Null(audit["UpstreamStatus"]);
+    }
+
+    [Fact]
+    public async Task EnvSet_WhenTheCurrentValuesCannotBeRead_NothingIsWritten()
+    {
+        _upstream = _ => Json("""{"error":"nope"}""", HttpStatusCode.NotFound);
+        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.env"]));
+
+        var response = await SendWithKeyAsync(HttpMethod.Put, EnvPath, key, """{"DB_TOKEN":"[redacted by White Rabbit]"}""");
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.DoesNotContain(_upstreamRequests, r => r.Method == HttpMethod.Put);
+    }
+
+    [Theory]
+    [InlineData("""["A","B"]""")]
+    [InlineData("""{"A":1}""")]
+    [InlineData("""{"A":{"value":"x"}}""")]
+    [InlineData("not json")]
+    public async Task EnvSet_BodyMustBeAnObjectOfStrings(string body)
+    {
+        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.env"]));
+
+        var response = await SendWithKeyAsync(HttpMethod.Put, EnvPath, key, body);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Empty(_upstreamRequests);
+    }
+
+    [Fact]
+    public async Task AppCreate_AnswerIsRedacted()
+    {
+        _upstream = _ => Json("""{"id":"app-9","containerTemplates":[{"id":"c","environmentVariables":[{"name":"K","value":"create-secret-4"}]}]}""", HttpStatusCode.Created);
+        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.manage"]));
+
+        var response = await SendWithKeyAsync(HttpMethod.Post, "/proxy/api.bunny.net/mc/apps", key, """{"name":"preview-42"}""");
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain("create-secret-4", body);
+        Assert.Contains("app-9", body);
+    }
+
+    [Theory]
+    [InlineData("GET", "/proxy/api.bunny.net/database/v2/databases", "db.read")]
+    [InlineData("GET", "/proxy/api.bunny.net/database/v1/config", "db.read")]
+    [InlineData("POST", "/proxy/api.bunny.net/database/v2/databases", "db.manage")]
+    [InlineData("PUT", "/proxy/api.bunny.net/database/v2/databases/db-1/auth/generate", "db.token")]
+    [InlineData("GET", "/proxy/api.bunny.net/mc/apps", "mc.read")]
+    [InlineData("POST", "/proxy/api.bunny.net/mc/apps/app-1/restart", "mc.deploy")]
+    [InlineData("PUT", "/proxy/api.bunny.net/mc/apps/app-1/containers/c-api/env", "mc.env")]
+    [InlineData("POST", "/proxy/api.bunny.net/mc/apps", "mc.manage")]
+    [InlineData("DELETE", "/proxy/api.bunny.net/mc/apps/app-1", "mc.manage")]
+    [InlineData("DELETE", "/proxy/api.bunny.net/database/v2/databases/db-1", "db.manage")]
+    public async Task NewOperations_NeedTheirOwnCapability(string method, string path, string capability)
+    {
+        var others = new[] { "db.read", "db.manage", "db.token", "mc.read", "mc.deploy", "mc.env", "mc.manage" }.Where(c => c != capability).ToArray();
+        var without = await CredentialAsync(await HumanSessionAsync(grants: others));
+        Assert.Equal(HttpStatusCode.Forbidden, (await SendWithKeyAsync(new HttpMethod(method), path, without, method is "GET" or "DELETE" ? null : "{}")).StatusCode);
+
+        await GrantAsync(Email, WhiteRabbitFactory.CliClient, capability);
+        var with = await CredentialAsync((await ExchangeAsync(DexToken(Email))).Body.GetProperty("access_token").GetString()!);
+        Assert.Equal(HttpStatusCode.OK, (await SendWithKeyAsync(new HttpMethod(method), path, with, method is "GET" or "DELETE" ? null : "{}")).StatusCode);
+    }
+
+    [Theory]
+    [InlineData("GET", "/proxy/api.bunny.net/mc/log/forwarding")]
+    [InlineData("GET", "/proxy/api.bunny.net/mc/registries/7")]
+    [InlineData("DELETE", "/proxy/api.bunny.net/mc/registries/7")]
+    [InlineData("DELETE", "/proxy/api.bunny.net/mc/apps/app-1/volumes/v-1")]
+    [InlineData("POST", "/proxy/api.bunny.net/database/v1/groups/g-1/auth/generate")]
+    public async Task DeliberatelyUnsupportedOperations_AreNotFound(string method, string path)
+    {
+        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.read", "mc.deploy", "mc.env", "mc.manage", "db.read", "db.manage", "db.token"]));
+        Assert.Equal(HttpStatusCode.NotFound, (await SendWithKeyAsync(new HttpMethod(method), path, key, method is "GET" or "DELETE" ? null : "{}")).StatusCode);
+        Assert.Empty(_upstreamRequests);
+    }
+
+    private Task<HttpResponseMessage> SendWithKeyAsync(HttpMethod method, string path, string accessKey, string? jsonBody)
+    {
+        var request = new HttpRequestMessage(method, path);
+        request.Headers.Add("AccessKey", accessKey);
+        if (jsonBody is not null) request.Content = new StringContent(jsonBody, System.Text.Encoding.UTF8, "application/json");
+        return _client.SendAsync(request);
     }
 
     // ================================================================ Dex PKCE

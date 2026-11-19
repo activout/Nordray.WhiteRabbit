@@ -41,15 +41,38 @@ OIDC client (app, CLI, ...)
 4. White Rabbit looks up every incoming proxy request in a hard-coded operation registry. Anything not in the registry is rejected with `404`. Anything the client hasn't been granted is rejected with `403`.
 5. Approved requests have the user's bunny.net API key injected server-side and are forwarded to `https://api.bunny.net` via YARP.
 
-## Supported bunny.net APIs (v1)
+## Supported bunny.net APIs
 
-| Area | Operations |
-|---|---|
-| Regions | List regions |
-| Statistics | Read account statistics |
-| Pull Zones | List, get, create, update, delete |
-| DNS Zones | List, get, create, update, delete |
-| Shield | List zones, get zone, update zone |
+| Area | Operations | Capabilities |
+|---|---|---|
+| Regions | List regions | (sign-in only) |
+| Statistics | Read account statistics | `statistics.read` |
+| Pull Zones | List, get, create, update, delete | `pullzone.read`, `pullzone.write` |
+| DNS Zones | List, get, create, update, delete | `dns.read`, `dns.write` |
+| Shield | List zones, get zone, update zone | `shield.read`, `shield.write` |
+| Magic Containers | List and get apps, app overview, get container, regions, list registries | `mc.read` |
+| Magic Containers | Change a container's image, deploy, restart | `mc.deploy` |
+| Magic Containers | Set a container's environment variables | `mc.env` |
+| Magic Containers | Create and delete apps, e.g. preview deployments | `mc.manage` |
+| Bunny Database | Configuration, limits, optimal regions, list and get databases | `db.read` |
+| Bunny Database | Create and delete databases | `db.manage` |
+| Bunny Database | Create a database access token (the token itself gives direct access to that database) | `db.token` |
+
+**Redaction.** Some responses hold secrets the capability does not cover. White Rabbit replaces those fields with `[redacted by White Rabbit]` before the caller sees them:
+- container environment variable values, in the app, app-create, container, container-update and set-environment responses;
+- registry password fragments, in the registry list.
+
+Everything else, such as IDs and names, is returned unchanged. A successful response that cannot be parsed for redaction is refused (502), not passed through.
+
+**Setting environment variables keeps redacted values.** Setting a container's environment replaces all of its variables, and tools such as `bunny apps env set` send back every variable they read. White Rabbit gave them the placeholder, so before forwarding, each value equal to `[redacted by White Rabbit]` is replaced with that variable's current value, read with the owner's key. A placeholder for a variable the container does not have is refused (400). If the current values cannot be read, nothing is written (502). So `mc.env` can add, change and remove variables without ever reading one.
+
+**`mc.deploy` changes only the image.** Bunny's container update also accepts environment variables, endpoints, volumes, probes and the entry point. White Rabbit forwards only the image fields and refuses any other field (400), even when it is null or empty.
+
+**Each capability has one description**, in `BunnyOperationRegistry`, covering every operation it allows. The consent page, `rabbit` and the capability table all show that text.
+
+**Deletes are explicit.** `mc.manage` and `db.manage` can delete any app or database on the account, not just ones they created. Grant them only to bindings that need them, e.g. a workflow that cleans up preview deployments.
+
+**Left out on purpose:** log forwarding (its responses carry tokens), registry changes and single-registry reads, volume and endpoint changes, and database groups and their tokens.
 
 New endpoints require a code review and an explicit entry in `BunnyOperationRegistry`. Bunny's OpenAPI specs are used for reference only — presence in the spec does not make an endpoint automatically available.
 

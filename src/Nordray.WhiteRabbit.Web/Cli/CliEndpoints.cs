@@ -58,15 +58,9 @@ public static class CliEndpoints
         {
             DexClientId = cli.Value.DexClientId,
             FederationAudience = federation.Value.Issuers.Count > 0 ? federation.Value.Audience : "",
-            Capabilities = registry.GetAll()
-                .Where(op => op.RequiredCapability is not null)
-                .GroupBy(op => op.RequiredCapability!)
-                .OrderBy(g => g.Key, StringComparer.Ordinal)
-                .Select(g =>
-                {
-                    var op = g.OrderBy(o => o.OperationId, StringComparer.Ordinal).First();
-                    return new { Name = g.Key, Title = op.ConsentTitle, Description = op.ConsentDescription };
-                }),
+            Capabilities = registry.GetCapabilities()
+                .OrderBy(c => c.Name, StringComparer.Ordinal)
+                .Select(c => new { c.Name, c.Title, c.Description }),
         }, Json);
 
     // ---------------------------------------------------------------- exchange

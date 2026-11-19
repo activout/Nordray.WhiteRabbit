@@ -20,6 +20,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Nordray.WhiteRabbit.Core\Nordray.WhiteRabbit.Core.csproj" />
     <ProjectReference Include="..\..\src\Nordray.WhiteRabbit.Bunny\Nordray.WhiteRabbit.Bunny.csproj" />
+    <ProjectReference Include="..\..\src\Nordray.WhiteRabbit.Proxy\Nordray.WhiteRabbit.Proxy.csproj" />
   </ItemGroup>
 
 </Project>

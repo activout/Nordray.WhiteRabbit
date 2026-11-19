@@ -4,10 +4,11 @@ namespace Nordray.WhiteRabbit.Infrastructure.Database;
 
 public interface ICapabilityDao
 {
-    /// <summary>Inserts the capability if no capability with that name exists yet.</summary>
+    /// <summary>Inserts the capability, or updates its text to the registry's current description.</summary>
     [SqlUpdate("""
-        INSERT OR IGNORE INTO Capabilities (Name, DisplayName, Description, CreatedUtc)
+        INSERT INTO Capabilities (Name, DisplayName, Description, CreatedUtc)
         VALUES (@name, @displayName, @description, @now)
+        ON CONFLICT (Name) DO UPDATE SET DisplayName = excluded.DisplayName, Description = excluded.Description
         """)]
     Task EnsureAsync(
         [Bind("name")] string name,

@@ -53,7 +53,11 @@ Tested with BunnyCLI 0.22.0.
 
 rabbit never falls back to talking to api.bunny.net directly.
 
-**Not supported through rabbit.** Commands that talk to other hosts directly: `storage files` (storage zone hosts) and `db shell` (the database host).
+**Commands that talk to other hosts.**
+- `storage files` is not supported through rabbit: it needs the zone password, which White Rabbit never hands out.
+- `db shell` works when the session has `db.token`. White Rabbit issues the database token, and BunnyCLI then connects to the database host directly with it.
+
+**Redacted values.** Magic Containers commands that show environment variable values (`apps env list/pull`, `apps pull`) see redacted values through rabbit; White Rabbit never returns them. `apps env set` and `apps env remove` still work with `mc.env`: they send every variable back, and White Rabbit puts the current value back wherever it finds the placeholder.
 
 ## Choosing the server
 

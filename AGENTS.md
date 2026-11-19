@@ -84,7 +84,7 @@ browser / CLI / app
 ## Bunny integration rules
 
 - **Base URL:** `https://api.bunny.net` only. Do not add `video.bunnycdn.com` or `storage.bunnycdn.com` in v1.
-- **API families in v1:** Core Platform (pull zones, DNS, statistics, regions) and Shield.
+- **API families:** Core Platform (pull zones, DNS, statistics, regions), Shield, and the reviewed subset of Magic Containers (`/mc/…`) and Bunny Database (`/database/…`). Fields that hold secrets the capability does not cover (e.g. environment variable values) are listed in `RedactJsonFields` and redacted in the response.
 - **Every proxied route must be listed in `BunnyOperationRegistry`.** An operation not in the registry is rejected with 404.
 - **Never auto-proxy based on OpenAPI alone.** OpenAPI specs may be used as a developer productivity aid (generating candidate lists, DTOs), but the registry is the sole runtime authority.
 - Bunny credentials are injected server side. They must never be returned to the client or logged.
@@ -131,6 +131,13 @@ dns.write
 statistics.read
 shield.read
 shield.write
+mc.read
+mc.deploy
+mc.env
+mc.manage
+db.read
+db.manage
+db.token
 ```
 
 ### Example registry entries
