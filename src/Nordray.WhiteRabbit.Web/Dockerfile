@@ -1,17 +1,17 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
-COPY Nordray.WhiteRabbit.sln ./
+# Shared build settings (target framework, warnings as errors) apply to every project.
+COPY Directory.Build.props ./
 COPY src/Nordray.WhiteRabbit.Core/Nordray.WhiteRabbit.Core.csproj                         src/Nordray.WhiteRabbit.Core/
 COPY src/Nordray.WhiteRabbit.Bunny/Nordray.WhiteRabbit.Bunny.csproj                       src/Nordray.WhiteRabbit.Bunny/
 COPY src/Nordray.WhiteRabbit.Infrastructure/Nordray.WhiteRabbit.Infrastructure.csproj     src/Nordray.WhiteRabbit.Infrastructure/
 COPY src/Nordray.WhiteRabbit.AuthProxy/Nordray.WhiteRabbit.AuthProxy.csproj               src/Nordray.WhiteRabbit.AuthProxy/
 COPY src/Nordray.WhiteRabbit.Proxy/Nordray.WhiteRabbit.Proxy.csproj                       src/Nordray.WhiteRabbit.Proxy/
 COPY src/Nordray.WhiteRabbit.Web/Nordray.WhiteRabbit.Web.csproj                           src/Nordray.WhiteRabbit.Web/
-COPY tests/Nordray.WhiteRabbit.Tests.Unit/Nordray.WhiteRabbit.Tests.Unit.csproj           tests/Nordray.WhiteRabbit.Tests.Unit/
-COPY tests/Nordray.WhiteRabbit.Tests.Integration/Nordray.WhiteRabbit.Tests.Integration.csproj tests/Nordray.WhiteRabbit.Tests.Integration/
 
-RUN dotnet restore
+# Restore only what the server needs; the solution also lists tests and examples.
+RUN dotnet restore src/Nordray.WhiteRabbit.Web/Nordray.WhiteRabbit.Web.csproj
 
 COPY . .
 

@@ -200,6 +200,12 @@ White Rabbit is designed to run as a two-container application on [bunny.net Mag
 
 Both containers communicate over `localhost`. White Rabbit's data, including the encrypted Data Protection key ring, lives in its database (Bunny Database when deployed); Dex keeps its own SQLite file on a persistent volume.
 
+**Image.** `.github/workflows/image.yml` publishes the server image to `ghcr.io/activout/nordray-whiterabbit`:
+- every push to `main` gets `:sha-<commit>` and `:main`;
+- every `v*` tag gets `:<tag>` and `:latest`.
+
+The run summary shows the digest. Deploy a pinned digest, not a moving tag. The image is generic: it holds no configuration, hostnames or secrets. Supply those as environment variables (see Configuration), for example from a secrets loader that you add as the entrypoint in your own image layer.
+
 ## Project layout
 
 ```
