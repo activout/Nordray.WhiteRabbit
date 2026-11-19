@@ -19,19 +19,19 @@ namespace Nordray.WhiteRabbit.Tests.Integration;
 /// The rabbit CLI flows end to end: token exchange for humans (Dex) and CI workloads (GitHub, Forgejo), virtual
 /// credentials, the Bunny proxy with a fake upstream, binding administration and the audit trail.
 /// </summary>
-public class CliFederationTests : IAsyncLifetime
+public abstract class CliFederationTests : IAsyncLifetime
 {
-    private const string Email = WhiteRabbitFactory.AllowedEmail;
-    private const string RealBunnyKey = "real-bunny-account-key-0123456789";
+    protected const string Email = WhiteRabbitFactory.AllowedEmail;
+    protected const string RealBunnyKey = "real-bunny-account-key-0123456789";
 
-    private TestDatabase _db = null!;
-    private WhiteRabbitFactory _factory = null!;
-    private HttpClient _client = null!;
-    private readonly List<HttpRequestMessage> _upstreamRequests = [];
-    private readonly List<string> _upstreamBodies = [];
+    protected TestDatabase _db = null!;
+    protected WhiteRabbitFactory _factory = null!;
+    protected HttpClient _client = null!;
+    protected readonly List<HttpRequestMessage> _upstreamRequests = [];
+    protected readonly List<string> _upstreamBodies = [];
 
     /// <summary>What the fake api.bunny.net answers; tests replace it.</summary>
-    private Func<HttpRequestMessage, HttpResponseMessage> _upstream =
+    protected Func<HttpRequestMessage, HttpResponseMessage> _upstream =
         _ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("""{"ok":true}""") };
 
     public async Task InitializeAsync()
@@ -58,7 +58,169 @@ public class CliFederationTests : IAsyncLifetime
         await _db.DisposeAsync();
     }
 
-    // ================================================================ discovery
+    // ================================================================ helpers
+
+    protected sealed record BindingBody(
+        string Issuer, string Repository, string? RepositoryId, string Ref, string WorkflowRef,
+        string? Environment = null, string[]? Events = null, string[]? Capabilities = null);
+
+    protected static BindingBody GitHubBinding(string? environment = null) => new(
+        "github", "activout/rabbit-ci-test", "123456", "refs/heads/main",
+        "activout/rabbit-ci-test/.github/workflows/rabbit.yml@refs/heads/main",
+        environment, Capabilities: ["statistics.read"]);
+
+    protected static BindingBody ForgejoBinding() => new(
+        "codebahn", "activout/rabbit-ci-test", null, "refs/heads/main",
+        "activout/rabbit-ci-test/.forgejo/workflows/rabbit.yml@refs/heads/main",
+        Capabilities: ["statistics.read"]);
+
+    protected static string GitHubToken(Dictionary<string, object>? claims = null) =>
+        IdentityTokens.Create(WhiteRabbitFactory.GitHubIssuer, WhiteRabbitFactory.FederationAudience, claims ?? IdentityTokens.GitHubClaims());
+
+    protected static string ForgejoToken(Dictionary<string, object>? claims = null) =>
+        IdentityTokens.Create(WhiteRabbitFactory.ForgejoIssuer, WhiteRabbitFactory.FederationAudience, claims ?? IdentityTokens.ForgejoClaims());
+
+    protected static string DexToken(string email, string audience = WhiteRabbitFactory.CliClient, DateTime? issuedAt = null, TimeSpan? lifetime = null) =>
+        IdentityTokens.Create(WhiteRabbitFactory.Issuer, audience, new Dictionary<string, object> { ["sub"] = "dex-" + email, ["email"] = email }, issuedAt, lifetime);
+
+    /// <summary>A signed-in human with a stored Bunny key and a session for the rabbit CLI.</summary>
+    protected async Task<string> HumanSessionAsync(params string[] grants)
+    {
+        await CreateUserAsync(Email);
+        if (grants.Length > 0) await GrantAsync(Email, WhiteRabbitFactory.CliClient, grants);
+        var (status, body) = await ExchangeAsync(DexToken(Email));
+        Assert.Equal(HttpStatusCode.OK, status);
+        return body.GetProperty("access_token").GetString()!;
+    }
+
+    protected async Task CreateUserAsync(string email)
+    {
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var users = scope.ServiceProvider.GetRequiredService<IUserRepository>();
+        if (await users.FindByEmailAsync(email) is not null) return;
+        await users.InsertAsync(new User { Subject = "subject-" + email, Email = email, CreatedUtc = DateTime.UtcNow, LastLoginUtc = DateTime.UtcNow });
+        var user = (await users.FindByEmailAsync(email))!;
+        var protector = scope.ServiceProvider.GetRequiredService<IDataProtectionProvider>().CreateProtector("BunnyApiKey.v1");
+        await users.UpdateBunnyApiKeyAsync(user.Id, protector.Protect(RealBunnyKey));
+    }
+
+    protected async Task GrantAsync(string email, string client, params string[] capabilities)
+    {
+        await using var scope = _factory.Services.CreateAsyncScope();
+        await scope.ServiceProvider.GetRequiredService<IGrantService>().StoreGrantAsync(email, client, capabilities);
+    }
+
+    protected async Task<(HttpStatusCode Status, JsonElement Body)> ExchangeAsync(string token)
+    {
+        var response = await _client.PostAsJsonAsync("/api/cli/exchange", new { subject_token = token });
+        return (response.StatusCode, await response.Content.ReadFromJsonAsync<JsonElement>());
+    }
+
+    protected async Task AssertExchangeDenied(string token, string reason)
+    {
+        var (status, body) = await ExchangeAsync(token);
+        Assert.Equal(HttpStatusCode.Unauthorized, status);
+        Assert.Equal(reason, body.GetProperty("reason").GetString());
+        var events = await SecurityEventsAsync();
+        Assert.Contains(events, e => (string?)e["EventType"] == "cli.exchange" && (string?)e["Outcome"] == "denied" && (string?)e["Reason"] == reason);
+        Assert.Empty(_upstreamRequests);
+    }
+
+    protected async Task<(HttpStatusCode Status, JsonElement Body)> CreateBindingAsync(string session, BindingBody body)
+    {
+        var response = await SendAsync(HttpMethod.Post, "/api/admin/bindings", session, new
+        {
+            issuer = body.Issuer,
+            repository = body.Repository,
+            repository_id = body.RepositoryId,
+            @ref = body.Ref,
+            workflow_ref = body.WorkflowRef,
+            environment = body.Environment,
+            events = body.Events,
+            capabilities = body.Capabilities,
+        });
+        var text = await response.Content.ReadAsStringAsync();
+        return (response.StatusCode, text.Length == 0 ? default : JsonDocument.Parse(text).RootElement.Clone());
+    }
+
+    protected async Task<string> CredentialAsync(string session, params string[] capabilities)
+    {
+        var response = await SendAsync(HttpMethod.Post, "/api/cli/credentials", session, capabilities.Length > 0 ? new { capabilities } : null);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        return (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("access_key").GetString()!;
+    }
+
+    protected async Task<JsonElement> GetJsonAsync(string path, string session)
+    {
+        var response = await SendAsync(HttpMethod.Get, path, session);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        return await response.Content.ReadFromJsonAsync<JsonElement>();
+    }
+
+    protected Task<HttpResponseMessage> SendAsync(HttpMethod method, string path, string session, object? body = null)
+    {
+        var request = new HttpRequestMessage(method, path);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", session);
+        if (body is not null) request.Content = JsonContent.Create(body);
+        return _client.SendAsync(request);
+    }
+
+    protected Task<HttpResponseMessage> ProxyAsync(string accessKey, string path, string? correlationId = null)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, path);
+        request.Headers.Add("AccessKey", accessKey);
+        if (correlationId is not null) request.Headers.Add("X-Correlation-ID", correlationId);
+        return _client.SendAsync(request);
+    }
+
+    protected async Task<List<Dictionary<string, object?>>> SecurityEventsAsync()
+    {
+        await using var connection = _db.Factory.Create();
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM SecurityEvents ORDER BY Id";
+        await using var reader = await command.ExecuteReaderAsync();
+        var rows = new List<Dictionary<string, object?>>();
+        while (await reader.ReadAsync())
+            rows.Add(Enumerable.Range(0, reader.FieldCount).ToDictionary(reader.GetName, i => reader.IsDBNull(i) ? null : reader.GetValue(i)));
+        return rows;
+    }
+
+    protected async Task AssertNoSecretsInAuditAsync(params string[] secrets)
+    {
+        foreach (var row in await SecurityEventsAsync())
+            foreach (var value in row.Values.OfType<string>())
+                foreach (var secret in secrets)
+                    Assert.DoesNotContain(secret, value);
+
+        // Nor anywhere else in the database: sessions and keys are stored as hashes only.
+        await using var connection = _db.Factory.Create();
+        await connection.OpenAsync();
+        foreach (var table in new[] { "CliSessions", "VirtualCredentials", "SecurityEvents", "WorkloadBindings" })
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"SELECT * FROM {table}";
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+                for (var i = 0; i < reader.FieldCount; i++)
+                    if (!reader.IsDBNull(i) && reader.GetValue(i) is string value)
+                        foreach (var secret in secrets.Where(s => !s.StartsWith("real-", StringComparison.Ordinal)))
+                            Assert.DoesNotContain(secret, value);
+        }
+    }
+
+    protected async Task ExecuteAsync(string sql)
+    {
+        await using var connection = _db.Factory.Create();
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        await command.ExecuteNonQueryAsync();
+    }
+}
+
+public class CliFederationDiscoveryTests : CliFederationTests
+{
 
     [Fact]
     public async Task Config_TellsTheCliItsClientAudienceAndCapabilities()
@@ -79,7 +241,10 @@ public class CliFederationTests : IAsyncLifetime
         Assert.Contains("redacted", description);
     }
 
-    // ================================================================ human (Dex) exchange
+}
+
+public class CliFederationHumanExchangeTests : CliFederationTests
+{
 
     [Fact]
     public async Task Human_ExchangeDexToken_GetsSessionWithGrantedCapabilities()
@@ -120,7 +285,10 @@ public class CliFederationTests : IAsyncLifetime
         await AssertExchangeDenied(DexToken("stranger@example.org"), "user_not_allowed");
     }
 
-    // ================================================================ GitHub workload
+}
+
+public class CliFederationGitHubWorkloadTests : CliFederationTests
+{
 
     [Fact]
     public async Task GitHub_MatchingBinding_EndToEnd_InjectsOwnerKeyAndAuditsWithoutSecrets()
@@ -255,7 +423,10 @@ public class CliFederationTests : IAsyncLifetime
         await AssertExchangeDenied(GitHubToken(), "ambiguous_binding");
     }
 
-    // ================================================================ Forgejo workload
+}
+
+public class CliFederationForgejoWorkloadTests : CliFederationTests
+{
 
     [Fact]
     public async Task Forgejo_MatchingBinding_GetsWorkloadSession()
@@ -301,7 +472,10 @@ public class CliFederationTests : IAsyncLifetime
         Assert.Equal("invalid_binding", body.GetProperty("error").GetString());
     }
 
-    // ================================================================ binding administration
+}
+
+public class CliFederationBindingAdministrationTests : CliFederationTests
+{
 
     [Theory]
     [InlineData("pull_request")]
@@ -379,7 +553,10 @@ public class CliFederationTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.OK, (await ExchangeAsync(GitHubToken())).Status);
     }
 
-    // ================================================================ credentials and proxy
+}
+
+public class CliFederationCredentialsAndProxyTests : CliFederationTests
+{
 
     [Fact]
     public async Task Credentials_CannotBeBroaderThanTheSession()
@@ -524,7 +701,10 @@ public class CliFederationTests : IAsyncLifetime
         Assert.Contains("user_not_allowed", await response.Content.ReadAsStringAsync());
     }
 
-    // ================================================================ Magic Containers and Bunny Database (Phase 6)
+}
+
+public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
+{
 
     private const string AppWithSecrets = """
         {"id":"app-1","name":"nordray-access-test","containerTemplates":[
@@ -789,7 +969,10 @@ public class CliFederationTests : IAsyncLifetime
         return _client.SendAsync(request);
     }
 
-    // ================================================================ Dex PKCE
+}
+
+public class CliFederationDexPkceTests : CliFederationTests
+{
 
     [Theory]
     [InlineData("client_id=rabbit-cli&response_type=code&redirect_uri=http://127.0.0.1:5000/callback", HttpStatusCode.BadRequest)]
@@ -809,163 +992,4 @@ public class CliFederationTests : IAsyncLifetime
             Assert.StartsWith("/login", response.Headers.Location!.OriginalString); // reaches the normal login
     }
 
-    // ================================================================ helpers
-
-    private sealed record BindingBody(
-        string Issuer, string Repository, string? RepositoryId, string Ref, string WorkflowRef,
-        string? Environment = null, string[]? Events = null, string[]? Capabilities = null);
-
-    private static BindingBody GitHubBinding(string? environment = null) => new(
-        "github", "activout/rabbit-ci-test", "123456", "refs/heads/main",
-        "activout/rabbit-ci-test/.github/workflows/rabbit.yml@refs/heads/main",
-        environment, Capabilities: ["statistics.read"]);
-
-    private static BindingBody ForgejoBinding() => new(
-        "codebahn", "activout/rabbit-ci-test", null, "refs/heads/main",
-        "activout/rabbit-ci-test/.forgejo/workflows/rabbit.yml@refs/heads/main",
-        Capabilities: ["statistics.read"]);
-
-    private static string GitHubToken(Dictionary<string, object>? claims = null) =>
-        IdentityTokens.Create(WhiteRabbitFactory.GitHubIssuer, WhiteRabbitFactory.FederationAudience, claims ?? IdentityTokens.GitHubClaims());
-
-    private static string ForgejoToken(Dictionary<string, object>? claims = null) =>
-        IdentityTokens.Create(WhiteRabbitFactory.ForgejoIssuer, WhiteRabbitFactory.FederationAudience, claims ?? IdentityTokens.ForgejoClaims());
-
-    private static string DexToken(string email, string audience = WhiteRabbitFactory.CliClient, DateTime? issuedAt = null, TimeSpan? lifetime = null) =>
-        IdentityTokens.Create(WhiteRabbitFactory.Issuer, audience, new Dictionary<string, object> { ["sub"] = "dex-" + email, ["email"] = email }, issuedAt, lifetime);
-
-    /// <summary>A signed-in human with a stored Bunny key and a session for the rabbit CLI.</summary>
-    private async Task<string> HumanSessionAsync(params string[] grants)
-    {
-        await CreateUserAsync(Email);
-        if (grants.Length > 0) await GrantAsync(Email, WhiteRabbitFactory.CliClient, grants);
-        var (status, body) = await ExchangeAsync(DexToken(Email));
-        Assert.Equal(HttpStatusCode.OK, status);
-        return body.GetProperty("access_token").GetString()!;
-    }
-
-    private async Task CreateUserAsync(string email)
-    {
-        await using var scope = _factory.Services.CreateAsyncScope();
-        var users = scope.ServiceProvider.GetRequiredService<IUserRepository>();
-        if (await users.FindByEmailAsync(email) is not null) return;
-        await users.InsertAsync(new User { Subject = "subject-" + email, Email = email, CreatedUtc = DateTime.UtcNow, LastLoginUtc = DateTime.UtcNow });
-        var user = (await users.FindByEmailAsync(email))!;
-        var protector = scope.ServiceProvider.GetRequiredService<IDataProtectionProvider>().CreateProtector("BunnyApiKey.v1");
-        await users.UpdateBunnyApiKeyAsync(user.Id, protector.Protect(RealBunnyKey));
-    }
-
-    private async Task GrantAsync(string email, string client, params string[] capabilities)
-    {
-        await using var scope = _factory.Services.CreateAsyncScope();
-        await scope.ServiceProvider.GetRequiredService<IGrantService>().StoreGrantAsync(email, client, capabilities);
-    }
-
-    private async Task<(HttpStatusCode Status, JsonElement Body)> ExchangeAsync(string token)
-    {
-        var response = await _client.PostAsJsonAsync("/api/cli/exchange", new { subject_token = token });
-        return (response.StatusCode, await response.Content.ReadFromJsonAsync<JsonElement>());
-    }
-
-    private async Task AssertExchangeDenied(string token, string reason)
-    {
-        var (status, body) = await ExchangeAsync(token);
-        Assert.Equal(HttpStatusCode.Unauthorized, status);
-        Assert.Equal(reason, body.GetProperty("reason").GetString());
-        var events = await SecurityEventsAsync();
-        Assert.Contains(events, e => (string?)e["EventType"] == "cli.exchange" && (string?)e["Outcome"] == "denied" && (string?)e["Reason"] == reason);
-        Assert.Empty(_upstreamRequests);
-    }
-
-    private async Task<(HttpStatusCode Status, JsonElement Body)> CreateBindingAsync(string session, BindingBody body)
-    {
-        var response = await SendAsync(HttpMethod.Post, "/api/admin/bindings", session, new
-        {
-            issuer = body.Issuer,
-            repository = body.Repository,
-            repository_id = body.RepositoryId,
-            @ref = body.Ref,
-            workflow_ref = body.WorkflowRef,
-            environment = body.Environment,
-            events = body.Events,
-            capabilities = body.Capabilities,
-        });
-        var text = await response.Content.ReadAsStringAsync();
-        return (response.StatusCode, text.Length == 0 ? default : JsonDocument.Parse(text).RootElement.Clone());
-    }
-
-    private async Task<string> CredentialAsync(string session, params string[] capabilities)
-    {
-        var response = await SendAsync(HttpMethod.Post, "/api/cli/credentials", session, capabilities.Length > 0 ? new { capabilities } : null);
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        return (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("access_key").GetString()!;
-    }
-
-    private async Task<JsonElement> GetJsonAsync(string path, string session)
-    {
-        var response = await SendAsync(HttpMethod.Get, path, session);
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        return await response.Content.ReadFromJsonAsync<JsonElement>();
-    }
-
-    private Task<HttpResponseMessage> SendAsync(HttpMethod method, string path, string session, object? body = null)
-    {
-        var request = new HttpRequestMessage(method, path);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", session);
-        if (body is not null) request.Content = JsonContent.Create(body);
-        return _client.SendAsync(request);
-    }
-
-    private Task<HttpResponseMessage> ProxyAsync(string accessKey, string path, string? correlationId = null)
-    {
-        var request = new HttpRequestMessage(HttpMethod.Get, path);
-        request.Headers.Add("AccessKey", accessKey);
-        if (correlationId is not null) request.Headers.Add("X-Correlation-ID", correlationId);
-        return _client.SendAsync(request);
-    }
-
-    private async Task<List<Dictionary<string, object?>>> SecurityEventsAsync()
-    {
-        await using var connection = _db.Factory.Create();
-        await connection.OpenAsync();
-        await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT * FROM SecurityEvents ORDER BY Id";
-        await using var reader = await command.ExecuteReaderAsync();
-        var rows = new List<Dictionary<string, object?>>();
-        while (await reader.ReadAsync())
-            rows.Add(Enumerable.Range(0, reader.FieldCount).ToDictionary(reader.GetName, i => reader.IsDBNull(i) ? null : reader.GetValue(i)));
-        return rows;
-    }
-
-    private async Task AssertNoSecretsInAuditAsync(params string[] secrets)
-    {
-        foreach (var row in await SecurityEventsAsync())
-            foreach (var value in row.Values.OfType<string>())
-                foreach (var secret in secrets)
-                    Assert.DoesNotContain(secret, value);
-
-        // Nor anywhere else in the database: sessions and keys are stored as hashes only.
-        await using var connection = _db.Factory.Create();
-        await connection.OpenAsync();
-        foreach (var table in new[] { "CliSessions", "VirtualCredentials", "SecurityEvents", "WorkloadBindings" })
-        {
-            await using var command = connection.CreateCommand();
-            command.CommandText = $"SELECT * FROM {table}";
-            await using var reader = await command.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-                for (var i = 0; i < reader.FieldCount; i++)
-                    if (!reader.IsDBNull(i) && reader.GetValue(i) is string value)
-                        foreach (var secret in secrets.Where(s => !s.StartsWith("real-", StringComparison.Ordinal)))
-                            Assert.DoesNotContain(secret, value);
-        }
-    }
-
-    private async Task ExecuteAsync(string sql)
-    {
-        await using var connection = _db.Factory.Create();
-        await connection.OpenAsync();
-        await using var command = connection.CreateCommand();
-        command.CommandText = sql;
-        await command.ExecuteNonQueryAsync();
-    }
 }
