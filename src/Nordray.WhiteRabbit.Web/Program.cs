@@ -334,6 +334,20 @@ app.MapGet("/ready", async (DbConnection connection, ILogger<DatabaseMigrator> l
 // --- rabbit CLI and binding administration API ---
 app.MapCliEndpoints();
 
+// Any /proxy path that is not a registered Bunny operation: never forwarded, but audited like every other proxy
+// decision. Registered operations are literal YARP routes, which take precedence over this catch-all.
+app.Map("/proxy/{**path}", async (HttpContext ctx, SecurityAudit audit) =>
+{
+    await audit.RecordAsync(new Nordray.WhiteRabbit.Core.Models.SecurityEvent
+    {
+        EventType = "proxy.request",
+        Outcome = Nordray.WhiteRabbit.Core.Models.SecurityEvent.Denied,
+        Reason = "unsupported_operation",
+        HttpStatus = StatusCodes.Status404NotFound,
+    });
+    return Results.Json(new { error = "unsupported_operation" }, statusCode: StatusCodes.Status404NotFound);
+}).AllowAnonymous().WithOrder(int.MaxValue);
+
 // --- Razor Pages ---
 app.MapRazorPages();
 

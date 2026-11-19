@@ -411,10 +411,45 @@ public class CliFederationTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Proxy_UnsupportedOperation_IsNotFoundEvenWithAValidKey()
+    public async Task Proxy_UnsupportedOperation_IsNotFoundEvenWithAValidKey_AndAudited()
     {
         var human = await HumanSessionAsync(grants: "statistics.read");
-        Assert.Equal(HttpStatusCode.NotFound, (await ProxyAsync(await CredentialAsync(human), "/proxy/api.bunny.net/apikey")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await ProxyAsync(await CredentialAsync(human), "/proxy/api.bunny.net/apikey?secret=x")).StatusCode);
+
+        var denied = (await SecurityEventsAsync()).Single(e => (string?)e["Reason"] == "unsupported_operation");
+        Assert.Equal("proxy.request", denied["EventType"]);
+        Assert.Equal("/proxy/api.bunny.net/apikey", denied["Path"]); // never the query string
+        Assert.Equal(404L, denied["HttpStatus"]);
+        Assert.Empty(_upstreamRequests);
+    }
+
+    [Theory]
+    [InlineData("/api/cli/revoke", "{\"credential_id\":123}", "application/json", HttpStatusCode.BadRequest)]
+    [InlineData("/api/cli/revoke", "{not json", "application/json", HttpStatusCode.BadRequest)]
+    [InlineData("/api/cli/revoke", "credential_id=abc", "application/x-www-form-urlencoded", HttpStatusCode.UnsupportedMediaType)]
+    [InlineData("/api/cli/credentials", "{\"capabilities\":\"statistics.read\"}", "application/json", HttpStatusCode.BadRequest)]
+    [InlineData("/api/cli/credentials", "null", "application/json", HttpStatusCode.BadRequest)]
+    public async Task MalformedBodies_AreRejectedNotTreatedAsEmpty(string path, string body, string contentType, HttpStatusCode expected)
+    {
+        var human = await HumanSessionAsync(grants: "statistics.read");
+        var request = new HttpRequestMessage(HttpMethod.Post, path) { Content = new StringContent(body, System.Text.Encoding.UTF8, contentType) };
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", human);
+
+        Assert.Equal(expected, (await _client.SendAsync(request)).StatusCode);
+
+        // Nothing was revoked and no credential was issued.
+        Assert.Equal(HttpStatusCode.OK, (await SendAsync(HttpMethod.Get, "/api/cli/whoami", human)).StatusCode);
+        Assert.DoesNotContain(await SecurityEventsAsync(), e => (string?)e["EventType"] is "cli.revoke" or "cli.credential");
+    }
+
+    [Fact]
+    public async Task Admin_OwnerRemovedFromAllowList_CannotListBindings()
+    {
+        var human = await HumanSessionAsync();
+        await CreateBindingAsync(human, GitHubBinding());
+        await ExecuteAsync($"UPDATE Users SET Email = 'gone@example.org' WHERE Email = '{Email}'");
+
+        Assert.Equal(HttpStatusCode.Forbidden, (await SendAsync(HttpMethod.Get, "/api/admin/bindings", human)).StatusCode);
     }
 
     [Fact]
@@ -465,6 +500,10 @@ public class CliFederationTests : IAsyncLifetime
     [InlineData("client_id=rabbit-cli&response_type=token&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256", HttpStatusCode.BadRequest)]
     [InlineData("client_id=rabbit-cli&response_type=code&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256", HttpStatusCode.Redirect)]
     [InlineData("client_id=example-client&response_type=code", HttpStatusCode.Redirect)]
+    // Repeated parameters: White Rabbit and Dex could read different values, so they are refused outright.
+    [InlineData("client_id=rabbit-cli&client_id=example-client&response_type=code", HttpStatusCode.BadRequest)]
+    [InlineData("client_id=example-client&client_id=rabbit-cli&response_type=code", HttpStatusCode.BadRequest)]
+    [InlineData("client_id=rabbit-cli&response_type=code&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&code_challenge_method=plain", HttpStatusCode.BadRequest)]
     public async Task DexAuth_RabbitCliRequiresPkceS256(string query, HttpStatusCode expected)
     {
         var response = await _client.GetAsync("/auth?" + query);
