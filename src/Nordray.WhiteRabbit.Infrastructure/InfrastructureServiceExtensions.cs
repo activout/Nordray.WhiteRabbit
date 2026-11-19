@@ -46,7 +46,14 @@ public static class InfrastructureServiceExtensions
 
         // --- Who may sign in ---
         services.Configure<AccessOptions>(configuration.GetSection("Access"));
-        services.AddSingleton(sp => new SignInPolicy(sp.GetRequiredService<IOptions<AccessOptions>>().Value));
+        services.AddSingleton(sp =>
+        {
+            // Follows configuration reloads, so removing an address takes effect without a restart.
+            var monitor = sp.GetRequiredService<IOptionsMonitor<AccessOptions>>();
+            var policy = new SignInPolicy(monitor.CurrentValue);
+            monitor.OnChange(policy.Update);
+            return policy;
+        });
 
         // --- Email ---
         services.Configure<MailjetOptions>(configuration.GetSection("Mailjet"));

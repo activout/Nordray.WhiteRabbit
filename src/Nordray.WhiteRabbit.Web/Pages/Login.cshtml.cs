@@ -47,10 +47,10 @@ public sealed class LoginModel(ILoginCodeService loginCodes, SignInPolicy signIn
             await loginCodes.GenerateAndSendAsync(Email, ip);
             logger.LogInformation("Login code requested for {Email}", Email);
         }
-        catch (RateLimitExceededException ex)
+        catch (RateLimitExceededException)
         {
-            ErrorMessage = ex.Message;
-            return Page();
+            // Answered like any other request: a different response would reveal that the address is allowed.
+            logger.LogWarning("Login code refused: per-address rate limit reached");
         }
 
         return RedirectToPage("/LoginVerify", new

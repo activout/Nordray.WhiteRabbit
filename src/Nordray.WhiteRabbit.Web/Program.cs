@@ -46,6 +46,7 @@ builder.Services.AddScoped<CapabilitySeeder>();
 // DataProtection:EncryptionKey) instead of the container's file system, which is lost on replacement.
 // The application name is fixed so keys stay valid when the content root or container path changes.
 builder.Services.AddDataProtection().SetApplicationName("Nordray.WhiteRabbit");
+builder.Services.AddSingleton<KeyRingVerifier>();
 builder.Services.AddOptions<KeyManagementOptions>().Configure<IServiceProvider>((keys, services) =>
 {
     keys.XmlRepository = new DatabaseKeyRing(services);
@@ -69,8 +70,11 @@ builder.Services.AddAuthentication(options =>
 })
 .AddPolicyScheme("SmartScheme", "Cookie or Bearer", options =>
 {
+    // Dex bearer tokens are accepted only on Bunny proxy routes. Everywhere else (UI pages, consent, the Dex /auth
+    // flow) the allow-list-validated cookie is required, whatever Authorization header the request carries.
     options.ForwardDefaultSelector = ctx =>
-        ctx.Request.Headers.ContainsKey("Authorization")
+        ctx.Request.Path.StartsWithSegments("/proxy", StringComparison.OrdinalIgnoreCase)
+        && ctx.Request.Headers.ContainsKey("Authorization")
             ? JwtBearerDefaults.AuthenticationScheme
             : CookieAuthenticationDefaults.AuthenticationScheme;
 })
@@ -255,6 +259,9 @@ var bunnyKeyProtector = app.Services
 
 // Ensure database schema exists and capabilities are seeded before serving requests
 await app.Services.GetRequiredService<DatabaseInitializer>().InitializeAsync();
+// Refuse to start with a key that cannot read the stored key ring, or with stored Bunny keys but no key ring:
+// either would make every stored Bunny API key unreadable while the service reported itself ready.
+await app.Services.GetRequiredService<KeyRingVerifier>().VerifyAsync();
 using (var scope = app.Services.CreateScope())
 {
     await scope.ServiceProvider.GetRequiredService<CapabilitySeeder>().SeedAsync();
