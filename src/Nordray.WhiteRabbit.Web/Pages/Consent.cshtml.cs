@@ -36,37 +36,12 @@ public sealed class ConsentModel(IGrantService grants, BunnyOperationRegistry re
         var capabilities = Capabilities.Select(c => c.Name);
         await grants.StoreGrantAsync(email, ClientId, capabilities);
 
-        return Redirect(SafeReturnUrl(ReturnUrl));
+        return LocalRedirect(Url.IsLocalUrl(ReturnUrl) ? ReturnUrl : "/");
     }
 
-    public IActionResult OnPostDenyAsync()
-    {
-        // Parse redirect_uri + state from the original OIDC request so we can
-        // send the client a proper error redirect instead of leaving them hanging.
-        var oidcParams = ParseOidcParams(ReturnUrl);
-        if (oidcParams.TryGetValue("redirect_uri", out var redirectUri)
-            && Uri.TryCreate(redirectUri, UriKind.Absolute, out var redirectUriParsed)
-            && IsAllowedRedirectScheme(redirectUriParsed))
-        {
-            oidcParams.TryGetValue("state", out var state);
-            var errorUrl = QueryHelpers.AddQueryString(redirectUri,
-                new Dictionary<string, string?>
-                {
-                    ["error"] = "access_denied",
-                    ["error_description"] = "The user denied access.",
-                    ["state"] = state,
-                });
-            return Redirect(errorUrl);
-        }
-
-        return RedirectToPage("/Index");
-    }
-
-    // Only allow https:// and http://localhost redirect targets to prevent open-redirect
-    // attacks via non-web schemes (javascript:, file:, data:, etc.).
-    private static bool IsAllowedRedirectScheme(Uri uri) =>
-        uri.Scheme == Uri.UriSchemeHttps ||
-        (uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback);
+    // Denial ends on White Rabbit's own page. White Rabbit does not know which redirect URIs each Dex client
+    // registered, so redirecting to the requested redirect_uri would be an open redirect.
+    public IActionResult OnPostDenyAsync() => RedirectToPage("/Index");
 
     private void Populate(string returnUrl)
     {
@@ -102,17 +77,6 @@ public sealed class ConsentModel(IGrantService grants, BunnyOperationRegistry re
         return QueryHelpers.ParseQuery(returnUrl[(queryIndex + 1)..])
             .Where(kv => kv.Value.Count > 0)
             .ToDictionary(kv => kv.Key, kv => kv.Value.ToString());
-    }
-
-    private static string SafeReturnUrl(string returnUrl)
-    {
-        if (!string.IsNullOrEmpty(returnUrl)
-            && Uri.TryCreate(returnUrl, UriKind.Relative, out _)
-            && returnUrl.StartsWith('/'))
-        {
-            return returnUrl;
-        }
-        return "/";
     }
 
     public sealed record CapabilityViewModel(string Name, string DisplayName, string Description);

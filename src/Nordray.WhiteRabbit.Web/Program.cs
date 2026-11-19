@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.DataProtection.KeyManagement;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
 using Nordray.WhiteRabbit.AuthProxy;
 using Nordray.WhiteRabbit.Bunny;
@@ -147,25 +148,30 @@ builder.Services.AddAuthorization(options =>
         .RequireClaim(CliSessionAuthenticationHandler.PrincipalTypeClaim, Nordray.WhiteRabbit.Core.Models.PrincipalTypes.Human));
 });
 
+// --- Client address ---
+// Bunny's edge sits in front of the container and appends the caller's address to X-Forwarded-For; its addresses
+// are not a fixed set, so any proxy is trusted for exactly one hop (the right-most entry, which the edge wrote).
+// ponytail: safe only while the container is reachable solely through the Bunny edge; pin KnownIPNetworks if not.
+builder.Services.Configure<ForwardedHeadersOptions>(options =>
+{
+    options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+    options.ForwardLimit = 1;
+    options.KnownIPNetworks.Clear();
+    options.KnownProxies.Clear();
+});
+
 // --- Rate limiting ---
 builder.Services.AddRateLimiter(opts =>
 {
-    opts.AddFixedWindowLimiter("login", o =>
-    {
-        o.PermitLimit = 20;
-        o.Window = TimeSpan.FromHours(1);
-        o.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
-        o.QueueLimit = 0;
-    });
-
+    // Login code requests and verification, per client address: a shared window would let one caller lock
+    // everyone out. Per-address and per-code limits in LoginCodeService sit behind these.
+    opts.AddPolicy("login", ctx => RateLimitPartition.GetFixedWindowLimiter(
+        ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 20, Window = TimeSpan.FromHours(1), QueueLimit = 0 }));
     // Stricter limit on code verification to prevent brute-force of 6-digit codes.
-    opts.AddFixedWindowLimiter("login-verify", o =>
-    {
-        o.PermitLimit = 10;
-        o.Window = TimeSpan.FromMinutes(15);
-        o.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
-        o.QueueLimit = 0;
-    });
+    opts.AddPolicy("login-verify", ctx => RateLimitPartition.GetFixedWindowLimiter(
+        ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(15), QueueLimit = 0 }));
 
     // Token exchange and the CLI API, per client address.
     opts.AddPolicy(CliEndpoints.ExchangeRateLimit, ctx => RateLimitPartition.GetFixedWindowLimiter(
@@ -181,6 +187,7 @@ builder.Services.AddRateLimiter(opts =>
 // --- YARP routes and clusters ---
 
 var dexAddress = configuration["Dex:InternalAddress"] ?? "http://dex:5556";
+string[] RemoteIdentityHeaders = ["X-Remote-User", "X-Remote-Groups", "X-Remote-Extra"];
 
 var dexRoutes = new List<RouteConfig>
 {
@@ -237,14 +244,19 @@ builder.Services.AddReverseProxy()
     .LoadFromMemory([.. dexRoutes, .. bunnyRoutes], [dexCluster, bunnyCluster])
     .AddTransforms(ctx =>
     {
-        // Dex: inject X-Remote-User for the authproxy connector.
-        // The connector requires it on both /auth/* and /callback/* requests.
-        if (ctx.Route.RouteId is "dex-auth" or "dex-callback")
+        // Dex: Dex trusts X-Remote-User as the signed-in identity, so a client-supplied value never reaches it on any
+        // route. On /auth/* and /callback/* (where the authproxy connector reads it) only the verified email is set.
+        if (ctx.Route.ClusterId == "dex")
         {
+            var injectUser = ctx.Route.RouteId is "dex-auth" or "dex-callback";
             ctx.AddRequestTransform(transform =>
             {
-                var email = DexAuthProxyMiddleware.GetRemoteUser(transform.HttpContext)
-                         ?? transform.HttpContext.User.FindFirstValue(ClaimTypes.Email);
+                foreach (var header in RemoteIdentityHeaders)
+                    transform.ProxyRequest.Headers.Remove(header);
+                var email = injectUser
+                    ? DexAuthProxyMiddleware.GetRemoteUser(transform.HttpContext)
+                      ?? transform.HttpContext.User.FindFirstValue(ClaimTypes.Email)
+                    : null;
                 if (email is not null)
                     transform.ProxyRequest.Headers.TryAddWithoutValidation("X-Remote-User", email);
                 return ValueTask.CompletedTask;
@@ -257,11 +269,9 @@ builder.Services.AddReverseProxy()
         if (ctx.Route.RouteId.StartsWith("bunny.", StringComparison.Ordinal))
         {
             ctx.AddPathRemovePrefix("/proxy/api.bunny.net");
-            ctx.AddRequestHeaderRemove("AccessKey");
-            ctx.AddRequestHeaderRemove("Authorization");
-            ctx.AddRequestHeaderRemove("X-Remote-User");
-            ctx.AddRequestHeaderRemove("X-Remote-Groups");
-            ctx.AddRequestHeaderRemove("X-Remote-Extra");
+            // Same list as the rabbit CLI forwarder: no caller credential or identity reaches bunny.
+            foreach (var header in (string[])["AccessKey", "Authorization", "Cookie", "Proxy-Authorization", .. RemoteIdentityHeaders])
+                ctx.AddRequestHeaderRemove(header);
             ctx.AddRequestTransform(transform =>
             {
                 transform.ProxyRequest.Headers.Host = "api.bunny.net";
@@ -336,6 +346,7 @@ using (var scope = app.Services.CreateScope())
     await scope.ServiceProvider.GetRequiredService<CapabilitySeeder>().SeedAsync();
 }
 
+app.UseForwardedHeaders();
 app.UseCorrelationId();
 app.UseStaticFiles();
 app.UseAuthentication();

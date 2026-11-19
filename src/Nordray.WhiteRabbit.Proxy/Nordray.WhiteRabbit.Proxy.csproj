@@ -18,4 +18,7 @@
     <ProjectReference Include="..\Nordray.WhiteRabbit.Infrastructure\Nordray.WhiteRabbit.Infrastructure.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Nordray.WhiteRabbit.Tests.Unit" />
+  </ItemGroup>
 </Project>

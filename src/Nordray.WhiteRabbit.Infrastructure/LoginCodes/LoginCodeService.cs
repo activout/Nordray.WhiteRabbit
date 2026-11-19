@@ -26,6 +26,8 @@ public sealed class LoginCodeService(
         if (recentCount >= opts.MaxCodesPerEmailPerHour)
             throw new RateLimitExceededException(
                 "Too many login code requests for this address. Please wait before trying again.");
+        if (await loginCodes.CountByEmailSinceAsync(email, now.AddSeconds(-opts.ResendCooldownSeconds)) > 0)
+            throw new RateLimitExceededException("A code was sent moments ago. Please wait before asking for another.");
 
         var salt = GenerateSalt();
         var code = GenerateCode();

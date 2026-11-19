@@ -17,7 +17,8 @@ public interface ILoginCodeRepository
     [SqlUpdate("UPDATE LoginCodes SET FailedAttempts = FailedAttempts + 1 WHERE Id = @id")]
     Task IncrementFailedAttemptsAsync([Bind("id")] long id);
 
-    [SqlQuery("SELECT COUNT(*) FROM LoginCodes WHERE Email = @email AND CreatedUtc > @since")]
+    // Case variants of one address share the limit.
+    [SqlQuery("SELECT COUNT(*) FROM LoginCodes WHERE lower(Email) = lower(@email) AND CreatedUtc > @since")]
     Task<long> CountByEmailSinceAsync([Bind("email")] string email, [Bind("since")] DateTime since);
 
     [SqlUpdate("DELETE FROM LoginCodes WHERE ExpiresUtc < @cutoff OR (ConsumedUtc IS NOT NULL AND ConsumedUtc < @cutoff)")]

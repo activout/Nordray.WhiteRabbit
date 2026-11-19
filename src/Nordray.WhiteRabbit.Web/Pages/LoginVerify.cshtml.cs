@@ -87,18 +87,6 @@ public sealed class LoginVerifyModel(
             principal,
             new AuthenticationProperties { IsPersistent = false });
 
-        return Redirect(SafeReturnUrl(ReturnUrl));
-    }
-
-    // Only allow relative URLs to prevent open-redirect attacks
-    private static string SafeReturnUrl(string? returnUrl)
-    {
-        if (!string.IsNullOrEmpty(returnUrl)
-            && Uri.TryCreate(returnUrl, UriKind.Relative, out _)
-            && returnUrl.StartsWith('/'))
-        {
-            return returnUrl;
-        }
-        return "/";
+        return LocalRedirect(Url.IsLocalUrl(ReturnUrl) ? ReturnUrl : "/");
     }
 }
