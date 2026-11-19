@@ -16,6 +16,11 @@ services:
       - WhiteRabbit_Mailjet__ApiKey=${MAILJET_API_KEY:-}
       - WhiteRabbit_Mailjet__SecretKey=${MAILJET_SECRET_KEY:-}
       - WhiteRabbit_Mailjet__FromEmail=${MAILJET_FROM_EMAIL:-noreply@example.com}
+      - WhiteRabbit_DataProtection__EncryptionKey=${WHITE_RABBIT_DATA_PROTECTION_KEY:?WHITE_RABBIT_DATA_PROTECTION_KEY must be set (openssl rand -base64 32)}
+      - WhiteRabbit_Access__AllowedEmails__0=${WHITE_RABBIT_ALLOWED_EMAIL:?WHITE_RABBIT_ALLOWED_EMAIL must be set (the address you sign in with)}
+      # Optional: everyone at one domain. More addresses or domains need more lines here (…__1, …__2).
+      - WhiteRabbit_Access__AllowedDomains__0=${WHITE_RABBIT_ALLOWED_DOMAIN:-}
+      - WhiteRabbit_Proxy__AllowedClientIds__0=example-client
     volumes:
       - ./data/white-rabbit:/data
     depends_on:

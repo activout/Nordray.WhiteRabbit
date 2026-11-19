@@ -22,7 +22,7 @@ White Rabbit:
 /src
   Nordray.WhiteRabbit.Web            ASP.NET Core host — routes, Razor pages, middleware pipeline
   Nordray.WhiteRabbit.Core           Domain types — BunnyOperation, capabilities, grants, login codes
-  Nordray.WhiteRabbit.Infrastructure Email (Mailjet), SQLite (Activout.DatabaseClient), repositories
+  Nordray.WhiteRabbit.Infrastructure Email (Mailjet), libSQL (Activout.DatabaseClient), DAOs, migrations
   Nordray.WhiteRabbit.Proxy          YARP configuration, credential injection, audit middleware
   Nordray.WhiteRabbit.Bunny          BunnyOperationRegistry, BunnyCredentialKind
   Nordray.WhiteRabbit.AuthProxy      Dex authproxy integration, X-Remote-User header logic
@@ -42,7 +42,7 @@ White Rabbit:
 | Web host | ASP.NET Core |
 | Request forwarding | YARP (`Microsoft.ReverseProxy`) |
 | OIDC provider | Dex (separate container, authproxy connector) |
-| SQLite access | Activout.DatabaseClient + `Microsoft.Data.Sqlite` |
+| Database access | Activout.DatabaseClient + `LibSqlGateway` (`Activout.DatabaseClient.LibSql`) on `Nelknet.LibSQL.Data`. Never EF Core |
 | Email | Mailjet (`Mailjet.Api`) |
 | OIDC token validation | `Microsoft.AspNetCore.Authentication.OpenIdConnect` |
 | Unit tests | xUnit |
@@ -76,7 +76,7 @@ browser / CLI / app
         |
         +-----> bunny.net APIs (https://api.bunny.net)
         |
-        +-----> SQLite
+        +-----> libSQL (local file / Bunny Database)
 ```
 
 ---
@@ -201,7 +201,7 @@ Requirements:
 
 ---
 
-## Data model (SQLite)
+## Data model (libSQL; see `Database/Schema/*.sql` for the authoritative schema)
 
 ### users
 `Id`, `Subject`, `Email`, `DisplayName`, `CreatedUtc`, `LastLoginUtc`
@@ -224,19 +224,25 @@ Requirements:
 ### audit_events
 `Id`, `OccurredUtc`, `UserId`, `ClientId`, `OperationId`, `RequestMethod`, `RequestPath`, `DestinationHost`, `DestinationPath`, `Outcome`, `HttpStatusCode`, `ErrorCode`
 
-### settings
-Optional key/value table for simple app settings.
+### DataProtectionKeys
+`FriendlyName`, `Xml` (AES-256-GCM encrypted with `DataProtection:EncryptionKey`), `CreatedUtc`
+
+### SchemaMigrations
+`Version`, `Name`, `AppliedUtc`
 
 ---
 
 ## Database access conventions (Activout.DatabaseClient)
 
-- Install **both** `Activout.DatabaseClient` and `Activout.DatabaseClient.Dapper` — the Dapper gateway is a separate package.
-- Attributes live in `Activout.DatabaseClient.Attributes`: `[SqlQuery]`, `[SqlUpdate]`, `[Bind]`, `[BindProperties]`.
-- `DapperGateway` is in `Activout.DatabaseClient.Dapper`; `DatabaseClientBuilder` is in `Activout.DatabaseClient.Implementation`.
-- **`SELECT COUNT(*)` must return `Task<long>`, not `Task<int>`.** SQLite returns 64-bit integers for aggregate functions; using `int` causes a silent runtime mapping failure.
+- All database access goes through Activout.DatabaseClient DAO interfaces over `LibSqlGateway` (package `Activout.DatabaseClient.LibSql`). Never use EF Core, and never call Dapper directly on a connection: Dapper strips the `@` from parameter names and the libSQL provider rejects them. That is also why `DapperGateway` is not used.
+- One provider everywhere: `LibSQLConnection` for a local file, `Data Source=:memory:` in tests (one database per connection) and Bunny Database when deployed. `DatabaseConnectionFactory` creates connections; each request shares one scoped `DbConnection`.
+- Attributes live in `Activout.DatabaseClient.Attributes`: `[SqlQuery]`, `[SqlUpdate]`, `[Bind]`, `[BindProperties]`. `DatabaseClientBuilder` is in `Activout.DatabaseClient.Implementation`.
+- Transactions: the DAO extends `IWithTransactions` and each method that takes part has an `IDbTransaction?` parameter; pass the transaction to every statement in it. See `IGrantDao`.
+- Use `INSERT ... RETURNING Id` with `[SqlQuery]` to get a new row's ID.
+- **`SELECT COUNT(*)` must return `Task<long>`, not `Task<int>`.** SQLite returns 64-bit integers for aggregate functions.
 - All column names are PascalCase so Dapper maps them to C# properties without custom conventions.
-- `DateTimeOffset` values are stored as ISO 8601 UTC strings via custom Dapper type handlers registered in `DatabaseTypeHandlers`.
+- **Timestamps are UTC `DateTime`**, stored as `yyyy-MM-dd HH:mm:ss.fff` text, so text comparison follows time order. Do not use `DateTimeOffset`: the gateway stores it with its original offset (breaking comparisons) and cannot read it back. `SqliteTypeHandlers.Register()` runs once in `AddInfrastructure`.
+- Schema changes are new numbered files in `Database/Schema/` (embedded resources), applied by `DatabaseMigrator` at start-up. Never edit an applied migration; a failed one is fixed forward.
 
 ---
 
@@ -262,8 +268,8 @@ GET  /consent
 POST /consent/approve
 POST /consent/deny
 ANY  /proxy/{apiFamily}/{**path}
-GET  /.well-known/health
-GET  /.well-known/ready
+GET  /health   process liveness
+GET  /ready    database reachable and all migrations applied (503 otherwise)
 ```
 
 ---
@@ -293,6 +299,8 @@ export the variables in your shell or use a tool like `dotenv`.
 
 | Variable | Config key | Purpose |
 |---|---|---|
+| `WhiteRabbit_DataProtection__EncryptionKey` | `DataProtection:EncryptionKey` | Required. Base64 of 32 random bytes; encrypts the Data Protection key ring stored in the database |
+| `WhiteRabbit_Database__ConnectionString` | `Database:ConnectionString` | Secret when it carries a Bunny Database auth token |
 | `WhiteRabbit_Dex__ClientSecret` | `Dex:ClientSecret` | Shared secret between White Rabbit and Dex |
 | `WhiteRabbit_Mailjet__ApiKey` | `Mailjet:ApiKey` | Mailjet API key (omit to fall back to SMTP) |
 | `WhiteRabbit_Mailjet__SecretKey` | `Mailjet:SecretKey` | Mailjet secret key |
@@ -305,6 +313,8 @@ export the variables in your shell or use a tool like `dotenv`.
   "Dex": { "InternalAddress": "http://dex:5556", "IssuerUrl": "", "ClientId": "white-rabbit" },
   "Mailjet": { "FromName": "White Rabbit", "SmtpHost": "", "SmtpPort": 1025 },
   "Database": { "ConnectionString": "Data Source=./data/white-rabbit.db" },
+  "Access": { "AllowedEmails": [], "AllowedDomains": [] },
+  "Proxy": { "AllowedClientIds": [] },
   "LoginCode": { "ExpiryMinutes": 10, "ResendCooldownSeconds": 60 },
   "RateLimit": { "RequestsPerEmailPerHour": 5, "RequestsPerIpPerHour": 20 }
 }
@@ -414,7 +424,7 @@ Services:
 - `mailpit` — local SMTP/web UI for email testing
 
 Persistent volumes:
-- `./data/white-rabbit/white-rabbit.db` — SQLite database
+- `./data/white-rabbit/white-rabbit.db` — local libSQL database file
 - `./data/dex/` — Dex storage
 
 ---
@@ -424,7 +434,7 @@ Persistent volumes:
 - A user can sign in via emailed code
 - Dex issues OIDC tokens through the authproxy-based login flow
 - A client can request capabilities via consent screen
-- White Rabbit stores grants in SQLite
+- White Rabbit stores grants in its database
 - At least Core Platform + Shield bunny endpoints can be proxied successfully
 - Unsupported routes are denied (404)
 - Capability-protected routes are enforced (403)

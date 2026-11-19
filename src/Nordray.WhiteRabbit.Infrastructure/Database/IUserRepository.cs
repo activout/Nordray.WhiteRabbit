@@ -15,7 +15,7 @@ public interface IUserRepository
     Task InsertAsync([BindProperties] User user);
 
     [SqlUpdate("UPDATE Users SET LastLoginUtc = @lastLoginUtc WHERE Id = @id")]
-    Task UpdateLastLoginAsync([Bind("id")] long id, [Bind("lastLoginUtc")] DateTimeOffset lastLoginUtc);
+    Task UpdateLastLoginAsync([Bind("id")] long id, [Bind("lastLoginUtc")] DateTime lastLoginUtc);
 
     [SqlUpdate("UPDATE Users SET BunnyApiKey = @apiKey WHERE Id = @id")]
     Task UpdateBunnyApiKeyAsync([Bind("id")] long id, [Bind("apiKey")] string? apiKey);

@@ -1,37 +1,20 @@
-using Dapper;
-using Microsoft.Data.Sqlite;
+using Activout.DatabaseClient.Dapper;
+using Activout.DatabaseClient.Implementation;
+using Activout.DatabaseClient.LibSql;
+using Microsoft.Extensions.Logging;
 
 namespace Nordray.WhiteRabbit.Infrastructure.Database;
 
-public sealed class DatabaseInitializer(string connectionString)
+/// <summary>Runs once at start-up, before requests are served: applies migrations and prunes old login codes.</summary>
+public sealed class DatabaseInitializer(DatabaseConnectionFactory connections, ILoggerFactory loggerFactory)
 {
-    public async Task InitializeAsync()
+    public async Task InitializeAsync(CancellationToken ct = default)
     {
-        DatabaseTypeHandlers.Register();
-
-        var directory = Path.GetDirectoryName(
-            new SqliteConnectionStringBuilder(connectionString).DataSource);
-        if (!string.IsNullOrEmpty(directory))
-            Directory.CreateDirectory(directory);
-
-        await using var connection = new SqliteConnection(connectionString);
-        await connection.OpenAsync();
-
-        foreach (var statement in DatabaseSchema.Statements)
-            await connection.ExecuteAsync(statement);
-
-        foreach (var migration in DatabaseSchema.Migrations)
-        {
-            try { await connection.ExecuteAsync(migration); }
-            catch { /* column already exists — safe to ignore */ }
-        }
+        await using var connection = connections.Create();
+        await new DatabaseMigrator(connection, loggerFactory.CreateLogger<DatabaseMigrator>()).MigrateAsync(ct);
 
         // Remove expired and old consumed codes to keep the table from growing unbounded.
-        var cutoff = DateTimeOffset.UtcNow.AddHours(-24).ToString("O");
-        await connection.ExecuteAsync("""
-            DELETE FROM LoginCodes
-            WHERE ExpiresUtc < @cutoff
-               OR (ConsumedUtc IS NOT NULL AND ConsumedUtc < @cutoff)
-            """, new { cutoff });
+        var loginCodes = new DatabaseClientBuilder().With(new LibSqlGateway(connection)).Build<ILoginCodeRepository>();
+        await loginCodes.DeleteExpiredAsync(DateTime.UtcNow.AddHours(-24));
     }
 }

@@ -1,11 +1,12 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
+using Nordray.WhiteRabbit.Core.Access;
 using Nordray.WhiteRabbit.Core.Services;
 using Nordray.WhiteRabbit.Infrastructure.LoginCodes;
 
 namespace Nordray.WhiteRabbit.Web.Pages;
 
-public sealed class LoginModel(ILoginCodeService loginCodes, ILogger<LoginModel> logger) : PageModel
+public sealed class LoginModel(ILoginCodeService loginCodes, SignInPolicy signInPolicy, ILogger<LoginModel> logger) : PageModel
 {
     [BindProperty]
     public string Email { get; set; } = "";
@@ -33,15 +34,23 @@ public sealed class LoginModel(ILoginCodeService loginCodes, ILogger<LoginModel>
 
         var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
 
+        // An address that may not sign in gets the same response as one that may, so the form does not reveal
+        // the allow-list, but no code is created or sent.
+        if (!signInPolicy.IsAllowed(Email))
+        {
+            logger.LogWarning("Login code refused: address not on the sign-in allow-list");
+            return RedirectToPage("/LoginVerify", new { email = Email, returnUrl = ReturnUrl });
+        }
+
         try
         {
             await loginCodes.GenerateAndSendAsync(Email, ip);
             logger.LogInformation("Login code requested for {Email}", Email);
         }
-        catch (RateLimitExceededException ex)
+        catch (RateLimitExceededException)
         {
-            ErrorMessage = ex.Message;
-            return Page();
+            // Answered like any other request: a different response would reveal that the address is allowed.
+            logger.LogWarning("Login code refused: per-address rate limit reached");
         }
 
         return RedirectToPage("/LoginVerify", new

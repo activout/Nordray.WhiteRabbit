@@ -16,3 +16,6 @@ appsettings.Local.json
 *.suo
 *.user
 .DS_Store
+
+# rabbit CLI release build output (goreleaser)
+cli/dist/

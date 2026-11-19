@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
 using Microsoft.AspNetCore.RateLimiting;
+using Nordray.WhiteRabbit.Core.Access;
 using Nordray.WhiteRabbit.Core.Models;
 using Nordray.WhiteRabbit.Core.Services;
 using Nordray.WhiteRabbit.Infrastructure.Database;
@@ -14,6 +15,7 @@ namespace Nordray.WhiteRabbit.Web.Pages;
 public sealed class LoginVerifyModel(
     ILoginCodeService loginCodes,
     IUserRepository users,
+    SignInPolicy signInPolicy,
     ILogger<LoginVerifyModel> logger) : PageModel
 {
     [BindProperty]
@@ -38,7 +40,9 @@ public sealed class LoginVerifyModel(
         if (!ModelState.IsValid)
             return Page();
 
-        var verified = await loginCodes.VerifyAsync(Email, Code.Trim());
+        // Codes are never sent to addresses outside the allow-list; checking again here keeps a code issued
+        // before the address was removed from being used afterwards.
+        var verified = signInPolicy.IsAllowed(Email) && await loginCodes.VerifyAsync(Email, Code.Trim());
         if (!verified)
         {
             logger.LogWarning("Failed login code verification for {Email}", Email);
@@ -48,7 +52,7 @@ public sealed class LoginVerifyModel(
 
         logger.LogInformation("Successful login for {Email}", Email);
 
-        var now = DateTimeOffset.UtcNow;
+        var now = DateTime.UtcNow;
         var user = await users.FindByEmailAsync(Email);
 
         if (user is null)

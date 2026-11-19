@@ -20,7 +20,7 @@ public sealed class LoginCodeService(
     public async Task GenerateAndSendAsync(string email, string requestIp, CancellationToken ct = default)
     {
         var opts = options.Value;
-        var now = DateTimeOffset.UtcNow;
+        var now = DateTime.UtcNow;
 
         var recentCount = await loginCodes.CountByEmailSinceAsync(email, now.AddHours(-1));
         if (recentCount >= opts.MaxCodesPerEmailPerHour)
@@ -46,7 +46,7 @@ public sealed class LoginCodeService(
 
     public async Task<bool> VerifyAsync(string email, string code, CancellationToken ct = default)
     {
-        var now = DateTimeOffset.UtcNow;
+        var now = DateTime.UtcNow;
         var active = await loginCodes.FindActiveByEmailAsync(email, now);
         if (active is null) return false;
 
