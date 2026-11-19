@@ -12,6 +12,7 @@ public sealed class BunnyOperationRegistry
 {
     private const string BunnyApiBase = "https://api.bunny.net";
 
+
     private static readonly BunnyOperation[] All =
     [
         // --- Core Platform: Regions (auth-only, no capability required) ---
@@ -26,6 +27,21 @@ public sealed class BunnyOperationRegistry
             RequiresAuthenticationOnly: true,
             ConsentTitle: "List regions",
             ConsentDescription: "Read the list of available bunny.net regions."),
+
+        // --- Core Platform: User ---
+        // BunnyCLI reads it for `bunny whoami` and for the account ID (`apps deploy` uses it as the registry
+        // namespace).
+        new BunnyOperation(
+            OperationId: "core.user.get",
+            IncomingMethod: "GET",
+            IncomingPathTemplate: "/proxy/api.bunny.net/user",
+            DestinationBaseUrl: BunnyApiBase,
+            DestinationPathTemplate: "/user",
+            CredentialKind: BunnyCredentialKind.AccountApiKey,
+            RequiredCapability: "account.read",
+            RequiresAuthenticationOnly: false,
+            ConsentTitle: "Read account details",
+            ConsentDescription: "Read the account's ID, owner, contact, billing and address details."),
 
         // --- Core Platform: Statistics ---
         new BunnyOperation(
@@ -406,6 +422,20 @@ public sealed class BunnyOperationRegistry
             ConsentDescription: "Read the list of Bunny Database databases."),
 
         new BunnyOperation(
+            OperationId: "db.live.metrics",
+            IncomingMethod: "POST",
+            IncomingPathTemplate: "/proxy/api.bunny.net/database/v1/live/live_db",
+            DestinationBaseUrl: BunnyApiBase,
+            DestinationPathTemplate: "/database/v1/live/live_db",
+            CredentialKind: BunnyCredentialKind.AccountApiKey,
+            RequiredCapability: "db.read",
+            RequiresAuthenticationOnly: false,
+            ConsentTitle: "Read database status",
+            ConsentDescription: "Read whether Bunny Database databases are active, as `bunny db list` shows it.",
+            // A read despite POST: the body only names the databases ({"db_ids": [...]}).
+            AllowedBodyFields: ["db_ids"]),
+
+        new BunnyOperation(
             OperationId: "db.database.get",
             IncomingMethod: "GET",
             IncomingPathTemplate: "/proxy/api.bunny.net/database/v2/databases/{dbId}",
@@ -456,6 +486,9 @@ public sealed class BunnyOperationRegistry
 
     private static readonly CapabilityDescription[] Capabilities =
     [
+        new("account.read", "Read account details",
+            "Read the account's ID, the owner's name and email, roles, balance, billing details and address. " +
+            "`bunny whoami` and `bunny apps deploy` need it."),
         new("statistics.read", "Read statistics", "Read account-level traffic and billing statistics."),
         new("pullzone.read", "Read pull zones", "List the pull zones on the account and read their configuration."),
         new("pullzone.write", "Manage pull zones", "Create, change and delete any pull zone on the account."),
