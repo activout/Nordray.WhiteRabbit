@@ -46,6 +46,7 @@ OIDC client (app, CLI, ...)
 | Area | Operations | Capabilities |
 |---|---|---|
 | Regions | List regions | (sign-in only) |
+| Account | Account details (`bunny whoami`, the account ID for `bunny apps deploy`) | `account.read` |
 | Statistics | Read account statistics | `statistics.read` |
 | Pull Zones | List, get, create, update, delete | `pullzone.read`, `pullzone.write` |
 | DNS Zones | List, get, create, update, delete | `dns.read`, `dns.write` |
@@ -54,7 +55,7 @@ OIDC client (app, CLI, ...)
 | Magic Containers | Change a container's image, deploy, restart | `mc.deploy` |
 | Magic Containers | Set a container's environment variables | `mc.env` |
 | Magic Containers | Create and delete apps, e.g. preview deployments | `mc.manage` |
-| Bunny Database | Configuration, limits, optimal regions, list and get databases | `db.read` |
+| Bunny Database | Configuration, limits, optimal regions, list and get databases, database status | `db.read` |
 | Bunny Database | Create and delete databases | `db.manage` |
 | Bunny Database | Create a database access token (the token itself gives direct access to that database) | `db.token` |
 

@@ -20,6 +20,8 @@ public class RegistryAdditionsTests
     [InlineData("POST", "/proxy/api.bunny.net/mc/apps", "mc.app.create")]
     [InlineData("DELETE", "/proxy/api.bunny.net/mc/apps/abc", "mc.app.delete")]
     [InlineData("DELETE", "/proxy/api.bunny.net/database/v2/databases/x", "db.database.delete")]
+    [InlineData("POST", "/proxy/api.bunny.net/database/v1/live/live_db", "db.live.metrics")]
+    [InlineData("GET", "/proxy/api.bunny.net/user", "core.user.get")]
     public void PathsBunnyCliSends_AreRegistered(string method, string path, string operationId) =>
         Assert.Equal(operationId, _registry.FindByRequest(method, path)?.OperationId);
 
@@ -44,6 +46,23 @@ public class RegistryAdditionsTests
         Assert.DoesNotContain(_registry.GetAll(), o => o.IncomingPathTemplate.Contains("/log/forwarding", StringComparison.Ordinal));
         // The only token-issuing operation is the explicit db.token one.
         Assert.Equal(["db.token.generate"], _registry.GetAll().Where(o => o.IncomingPathTemplate.Contains("/auth/", StringComparison.Ordinal)).Select(o => o.OperationId));
+    }
+
+    [Fact]
+    public void DatabaseStatus_IsARead_ThatOnlyNamesDatabases()
+    {
+        var op = _registry.GetAll().Single(o => o.OperationId == "db.live.metrics");
+        Assert.Equal("db.read", op.RequiredCapability);
+        Assert.Equal(["db_ids"], op.AllowedBodyFields);
+    }
+
+    [Fact]
+    public void User_NeedsAccountRead()
+    {
+        var op = _registry.GetAll().Single(o => o.OperationId == "core.user.get");
+        Assert.Equal("account.read", op.RequiredCapability);
+        Assert.Equal(Core.BunnyCredentialKind.AccountApiKey, op.CredentialKind);
+        Assert.Empty(op.RedactJsonFields);
     }
 
     [Fact]

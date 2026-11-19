@@ -147,6 +147,7 @@ GET  /proxy/core/pullzone              -> capability: pullzone.read
 POST /proxy/core/pullzone              -> capability: pullzone.write
 GET  /proxy/core/statistics            -> capability: statistics.read
 GET  /proxy/core/region                -> RequiresAuthenticationOnly = true
+GET  /proxy/core/user                  -> account.read
 GET  /proxy/core/dns                   -> capability: dns.read
 POST /proxy/core/dns                   -> capability: dns.write
 GET  /proxy/shield                     -> capability: shield.read
