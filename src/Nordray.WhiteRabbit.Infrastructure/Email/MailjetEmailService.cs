@@ -1,6 +1,7 @@
 using System.Net.Mail;
 using Mailjet.Client;
 using Mailjet.Client.TransactionalEmails;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Nordray.WhiteRabbit.Core.Services;
@@ -9,6 +10,7 @@ namespace Nordray.WhiteRabbit.Infrastructure.Email;
 
 public sealed class MailjetEmailService(
     IOptions<MailjetOptions> options,
+    IHostEnvironment environment,
     ILogger<MailjetEmailService> logger) : IEmailService
 {
     public async Task SendLoginCodeAsync(string toEmail, string code, CancellationToken ct = default)
@@ -27,7 +29,9 @@ public sealed class MailjetEmailService(
             return;
         }
 
-        // Last resort: log the code so development is never completely blocked
+        // A login code is a credential: only a Development instance may fall back to logging it.
+        if (!environment.IsDevelopment())
+            throw new InvalidOperationException("No email transport configured (Mailjet:ApiKey or Mailjet:SmtpHost).");
         logger.LogInformation(
             "No email transport configured. Login code for {Email}: {Code}", toEmail, code);
     }
@@ -52,7 +56,8 @@ public sealed class MailjetEmailService(
     {
         using var smtp = new SmtpClient(opts.SmtpHost, opts.SmtpPort);
         smtp.DeliveryMethod = SmtpDeliveryMethod.Network;
-        smtp.EnableSsl = false;
+        // Plaintext only for the local Mailpit in Development.
+        smtp.EnableSsl = !environment.IsDevelopment();
 
         var from = string.IsNullOrEmpty(opts.FromEmail)
             ? "noreply@whiterabbit.local"

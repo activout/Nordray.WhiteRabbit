@@ -226,9 +226,11 @@ public sealed class RecordingEmailService : IEmailService
         get { lock (_recipients) return _recipients.ToList(); }
     }
 
+    public string? LastCode { get; private set; }
+
     public Task SendLoginCodeAsync(string toEmail, string code, CancellationToken ct = default)
     {
-        lock (_recipients) _recipients.Add(toEmail);
+        lock (_recipients) { _recipients.Add(toEmail); LastCode = code; }
         return Task.CompletedTask;
     }
 }

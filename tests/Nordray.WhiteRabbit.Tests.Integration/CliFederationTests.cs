@@ -165,10 +165,13 @@ public abstract class CliFederationTests : IAsyncLifetime
         return _client.SendAsync(request);
     }
 
-    protected Task<HttpResponseMessage> ProxyAsync(string accessKey, string path, string? correlationId = null)
+    protected Task<HttpResponseMessage> ProxyAsync(
+        string accessKey, string path, string? correlationId = null, Dictionary<string, string>? headers = null)
     {
         var request = new HttpRequestMessage(HttpMethod.Get, path);
         request.Headers.Add("AccessKey", accessKey);
+        foreach (var (name, value) in headers ?? [])
+            request.Headers.TryAddWithoutValidation(name, value);
         if (correlationId is not null) request.Headers.Add("X-Correlation-ID", correlationId);
         return _client.SendAsync(request);
     }
@@ -308,7 +311,12 @@ public class CliFederationGitHubWorkloadTests : CliFederationTests
         var key = await CredentialAsync(session);
         Assert.StartsWith("wrk_", key);
 
-        var response = await ProxyAsync(key, "/proxy/api.bunny.net/statistics", correlationId: "corr-123");
+        var response = await ProxyAsync(key, "/proxy/api.bunny.net/statistics", correlationId: "corr-123", headers: new()
+        {
+            ["Cookie"] = "WhiteRabbit.Session=secret",
+            ["Proxy-Authorization"] = "Basic c2VjcmV0",
+            ["X-Remote-User"] = "victim@example.com",
+        });
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal("corr-123", response.Headers.GetValues("X-Correlation-ID").Single());
 
@@ -316,7 +324,8 @@ public class CliFederationGitHubWorkloadTests : CliFederationTests
         var upstream = Assert.Single(_upstreamRequests);
         Assert.Equal("https://api.bunny.net/statistics", upstream.RequestUri!.ToString());
         Assert.Equal(RealBunnyKey, upstream.Headers.GetValues("AccessKey").Single());
-        Assert.False(upstream.Headers.Contains("Authorization"));
+        foreach (var header in new[] { "Authorization", "Cookie", "Proxy-Authorization", "X-Remote-User" })
+            Assert.False(upstream.Headers.Contains(header), header);
 
         // Every step is audited, attributed to the workload, and no secret appears anywhere in the trail.
         var events = await SecurityEventsAsync();

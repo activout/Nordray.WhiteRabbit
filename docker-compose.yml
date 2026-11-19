@@ -44,8 +44,7 @@ services:
 
   dex:
     image: dexidp/dex:v2.45.1
-    ports:
-      - "5556:5556"
+    # No published port: Dex trusts X-Remote-User, so it is reachable only through White Rabbit.
     environment:
       - DEX_WHITE_RABBIT_CLIENT_SECRET=${DEX_WHITE_RABBIT_CLIENT_SECRET:?DEX_WHITE_RABBIT_CLIENT_SECRET must be set}
       - DEX_EXAMPLE_CLIENT_SECRET=${DEX_EXAMPLE_CLIENT_SECRET:?DEX_EXAMPLE_CLIENT_SECRET must be set}

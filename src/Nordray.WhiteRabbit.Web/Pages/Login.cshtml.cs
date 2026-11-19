@@ -1,11 +1,13 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
+using Microsoft.AspNetCore.RateLimiting;
 using Nordray.WhiteRabbit.Core.Access;
 using Nordray.WhiteRabbit.Core.Services;
 using Nordray.WhiteRabbit.Infrastructure.LoginCodes;
 
 namespace Nordray.WhiteRabbit.Web.Pages;
 
+[EnableRateLimiting("login")]
 public sealed class LoginModel(ILoginCodeService loginCodes, SignInPolicy signInPolicy, ILogger<LoginModel> logger) : PageModel
 {
     [BindProperty]

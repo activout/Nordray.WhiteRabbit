@@ -5,6 +5,7 @@ using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.IdentityModel.Tokens;
+using RichardSzalay.MockHttp;
 
 namespace Nordray.WhiteRabbit.Tests.Integration;
 
@@ -104,6 +105,95 @@ public partial class WebApplicationTests : IAsyncLifetime
 
         Assert.All(statuses, s => Assert.Equal("302 /LoginVerify", s));
         Assert.True(_factory.Emails.Recipients.Count < 8, "the per-address limit should have stopped some codes");
+    }
+
+    [Fact]
+    public async Task Login_SecondRequestWithinCooldown_SendsNoSecondCode()
+    {
+        var client = _factory.CreateHttpsClient();
+        await RequestCodeAsync(client, WhiteRabbitFactory.AllowedEmail);
+        await RequestCodeAsync(client, WhiteRabbitFactory.AllowedEmail.ToUpperInvariant());
+
+        Assert.Single(_factory.Emails.Recipients);
+    }
+
+    // --- Redirects stay on White Rabbit ---
+
+    [Theory]
+    [InlineData("//evil.example/x")]
+    [InlineData("/\\evil.example/x")]
+    [InlineData("https://evil.example/x")]
+    public async Task LoginVerify_ForeignReturnUrl_RedirectsHome(string returnUrl)
+    {
+        var client = _factory.CreateHttpsClient();
+        var response = await SignInAsync(client, returnUrl);
+
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        Assert.Equal("/", response.Headers.Location!.OriginalString);
+    }
+
+    [Fact]
+    public async Task ConsentDeny_NeverRedirectsToTheRequestedRedirectUri()
+    {
+        var client = _factory.CreateHttpsClient();
+        await SignInAsync(client, "/");
+        var returnUrl = "/auth?client_id=example-client&scope=openid%20pullzone.read&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&state=s";
+        var form = await client.GetStringAsync("/consent?returnUrl=" + Uri.EscapeDataString(returnUrl));
+
+        var response = await client.PostAsync("/consent?handler=Deny", new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["ReturnUrl"] = returnUrl,
+            ["__RequestVerificationToken"] = AntiforgeryToken().Match(form).Groups[1].Value,
+        }));
+
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        Assert.Equal("/", response.Headers.Location!.OriginalString);
+    }
+
+    // --- Dex never sees a client-supplied identity header ---
+
+    [Fact]
+    public async Task DexCallback_ForgedRemoteUser_IsNotForwarded()
+    {
+        HttpRequestMessage? forwarded = null;
+        _factory.Upstream.When("http://127.0.0.1:9/*").Respond(request =>
+        {
+            forwarded = request;
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        });
+        var request = new HttpRequestMessage(HttpMethod.Get, "/callback/white-rabbit-authproxy?state=s");
+        request.Headers.Add("X-Remote-User", "victim@example.com");
+        request.Headers.Add("X-Remote-Groups", "admins");
+
+        await _factory.CreateHttpsClient().SendAsync(request);
+
+        Assert.NotNull(forwarded);
+        Assert.False(forwarded.Headers.Contains("X-Remote-User"));
+        Assert.False(forwarded.Headers.Contains("X-Remote-Groups"));
+    }
+
+    private async Task RequestCodeAsync(HttpClient client, string email)
+    {
+        var form = await client.GetStringAsync("/login");
+        await client.PostAsync("/login", new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["Email"] = email,
+            ["__RequestVerificationToken"] = AntiforgeryToken().Match(form).Groups[1].Value,
+        }));
+    }
+
+    /// <summary>Signs in with an emailed code and returns the verify response (the redirect after sign-in).</summary>
+    private async Task<HttpResponseMessage> SignInAsync(HttpClient client, string returnUrl)
+    {
+        await RequestCodeAsync(client, WhiteRabbitFactory.AllowedEmail);
+        var form = await client.GetStringAsync("/LoginVerify?email=" + Uri.EscapeDataString(WhiteRabbitFactory.AllowedEmail));
+        return await client.PostAsync("/LoginVerify", new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["Email"] = WhiteRabbitFactory.AllowedEmail,
+            ["Code"] = _factory.Emails.LastCode!,
+            ["ReturnUrl"] = returnUrl,
+            ["__RequestVerificationToken"] = AntiforgeryToken().Match(form).Groups[1].Value,
+        }));
     }
 
     // --- Proxy: audience and client identity ---

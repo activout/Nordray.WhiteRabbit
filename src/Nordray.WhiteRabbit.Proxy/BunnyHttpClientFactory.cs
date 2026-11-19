@@ -47,9 +47,12 @@ public sealed class BunnyHttpClientFactory : IForwarderHttpClientFactory
         return X509Certificate2.CreateFromPem(reader.ReadToEnd());
     }
 
-    private static bool ValidateAgainstIsrgRootX1(
+    // Only the chain check is replaced (pinned root instead of the system store); a name mismatch or a missing
+    // certificate is still fatal, so a certificate for another host under the same root is refused.
+    internal static bool ValidateAgainstIsrgRootX1(
         object? sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors errors)
     {
+        if ((errors & ~SslPolicyErrors.RemoteCertificateChainErrors) != SslPolicyErrors.None) return false;
         if (certificate is not X509Certificate2 cert) return false;
         using var customChain = new X509Chain();
         customChain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
