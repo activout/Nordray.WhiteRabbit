@@ -22,6 +22,7 @@ The script downloads the release archive and `SHA256SUMS` from GitHub Releases, 
 checksum is missing or wrong. Pin a version in CI. Windows: download the zip from the release page.
 
 BunnyCLI must be installed separately (`npm i -g @bunny.net/cli`, or its install script); rabbit never downloads it.
+On Windows, rabbit runs the native `bunny.exe` that npm installs next to its `bunny.cmd` launcher, never the launcher through `cmd.exe`; set `RABBIT_BUNNY` to `bunny.exe` if it is elsewhere.
 Tested with BunnyCLI 0.22.0.
 
 ## How it works

@@ -45,6 +45,14 @@ func ResolveBunny(getenv func(string) string, self string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if runtime.GOOS == "windows" && isScriptLauncher(abs) {
+		native, ok := NativeFromNpmLauncher(abs, runtime.GOARCH)
+		if !ok {
+			return "", fmt.Errorf("%s is an npm launcher script, which rabbit does not run through cmd.exe (argument quoting is unsafe there). "+
+				"Set RABBIT_BUNNY to BunnyCLI's bunny.exe, or install BunnyCLI with its install script", abs)
+		}
+		abs = native
+	}
 	if info, err := os.Stat(abs); err != nil || info.IsDir() {
 		return "", fmt.Errorf("BunnyCLI not found at %s", abs)
 	}
@@ -135,6 +143,8 @@ func Run(ctx context.Context, o Options) (int, error) {
 	}()
 
 	err = cmd.Wait()
+	// Stop delivery before closing: signal.Stop guarantees no further sends, so a late signal cannot hit a closed channel.
+	signal.Stop(signals)
 	close(signals)
 	if err == nil {
 		return 0, nil
@@ -144,6 +154,35 @@ func Run(ctx context.Context, o Options) (int, error) {
 		return exitCode(exit), nil
 	}
 	return 1, err
+}
+
+func isScriptLauncher(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".cmd", ".bat", ".ps1":
+		return true
+	}
+	return false
+}
+
+// NativeFromNpmLauncher finds the native BunnyCLI binary that `npm i -g @bunny.net/cli` installs next to its
+// launcher scripts: <prefix>/node_modules/@bunny.net/cli-windows-<arch>/bunny.exe, hoisted or nested under
+// @bunny.net/cli, the same package BunnyCLI's own bin/bunny.cjs resolves.
+func NativeFromNpmLauncher(launcher, goarch string) (string, bool) {
+	arch := map[string]string{"amd64": "x64", "arm64": "arm64"}[goarch]
+	if arch == "" {
+		return "", false
+	}
+	prefix := filepath.Dir(launcher)
+	platform := filepath.Join("@bunny.net", "cli-windows-"+arch, "bunny.exe")
+	for _, candidate := range []string{
+		filepath.Join(prefix, "node_modules", platform),
+		filepath.Join(prefix, "node_modules", "@bunny.net", "cli", "node_modules", platform),
+	} {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, true
+		}
+	}
+	return "", false
 }
 
 func sameFile(a, b string) bool {

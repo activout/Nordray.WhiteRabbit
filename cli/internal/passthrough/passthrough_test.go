@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -173,5 +175,46 @@ func TestForwarderWithoutCredentialAnswers401(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("got %d", resp.StatusCode)
+	}
+}
+
+func TestNativeFromNpmLauncher(t *testing.T) {
+	for _, layout := range []string{"hoisted", "nested"} {
+		t.Run(layout, func(t *testing.T) {
+			prefix := t.TempDir()
+			launcher := filepath.Join(prefix, "bunny.cmd")
+			if err := os.WriteFile(launcher, []byte("@echo off"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Join(prefix, "node_modules", "@bunny.net", "cli-windows-x64")
+			if layout == "nested" {
+				dir = filepath.Join(prefix, "node_modules", "@bunny.net", "cli", "node_modules", "@bunny.net", "cli-windows-x64")
+			}
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			exe := filepath.Join(dir, "bunny.exe")
+			if err := os.WriteFile(exe, []byte("MZ"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			got, ok := NativeFromNpmLauncher(launcher, "amd64")
+			if !ok || got != exe {
+				t.Fatalf("got %q %v, want %q", got, ok, exe)
+			}
+			if _, ok := NativeFromNpmLauncher(launcher, "arm64"); ok {
+				t.Fatal("arm64 must not resolve the x64 binary")
+			}
+		})
+	}
+	if _, ok := NativeFromNpmLauncher(filepath.Join(t.TempDir(), "bunny.cmd"), "amd64"); ok {
+		t.Fatal("a launcher without the native package must not resolve")
+	}
+}
+
+func TestIsScriptLauncher(t *testing.T) {
+	for path, want := range map[string]bool{`C:\npm\bunny.cmd`: true, `C:\npm\BUNNY.BAT`: true, `C:\npm\bunny.ps1`: true, `C:\bin\bunny.exe`: false, "/usr/bin/bunny": false} {
+		if got := isScriptLauncher(path); got != want {
+			t.Errorf("isScriptLauncher(%q) = %v", path, got)
+		}
 	}
 }

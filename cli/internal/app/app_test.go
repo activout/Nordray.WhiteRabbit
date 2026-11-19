@@ -293,3 +293,13 @@ func TestUsage(t *testing.T) {
 		t.Fatal("unknown options before -- are errors")
 	}
 }
+
+func TestLoginRejectsUnknownCapabilityBeforeOpeningTheBrowser(t *testing.T) {
+	h := newHarness(t)
+	opened := false
+	h.app.OpenBrowser = func(string) error { opened = true; return nil }
+	code := h.run("auth", "login", "--capabilities", "statistics.read,statistics.reed")
+	if code != 2 || opened || !strings.Contains(h.stderr.String(), `unknown capability "statistics.reed"`) {
+		t.Fatalf("exit %d, browser opened %v: %s", code, opened, h.stderr)
+	}
+}

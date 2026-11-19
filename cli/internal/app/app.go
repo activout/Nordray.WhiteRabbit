@@ -343,21 +343,32 @@ func (a *App) login(ctx context.Context, args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	discovery, err := client.Discovery(ctx)
-	if err != nil {
-		return 1, err
-	}
 	requested := make([]string, 0, len(cfg.Capabilities))
 	if *capabilities != "" {
+		known := make(map[string]bool, len(cfg.Capabilities))
+		names := make([]string, 0, len(cfg.Capabilities))
+		for _, c := range cfg.Capabilities {
+			known[c.Name] = true
+			names = append(names, c.Name)
+		}
 		for _, c := range strings.Split(*capabilities, ",") {
-			if c = strings.TrimSpace(c); c != "" {
-				requested = append(requested, c)
+			if c = strings.TrimSpace(c); c == "" {
+				continue
 			}
+			// An unknown name would be demanded at sign-in but can never be granted on the consent page.
+			if !known[c] {
+				return 2, usageError{fmt.Sprintf("unknown capability %q; this server offers: %s", c, strings.Join(names, ", "))}
+			}
+			requested = append(requested, c)
 		}
 	} else {
 		for _, c := range cfg.Capabilities {
 			requested = append(requested, c.Name)
 		}
+	}
+	discovery, err := client.Discovery(ctx)
+	if err != nil {
+		return 1, err
 	}
 	open := a.OpenBrowser
 	if *noBrowser {
