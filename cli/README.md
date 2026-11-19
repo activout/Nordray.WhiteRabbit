@@ -91,7 +91,17 @@ run it in the repository: who may push them, rulesets, or a protected GitHub env
 
 See [`examples/ci`](../examples/ci) for complete workflows.
 
-AI agents: [`skills/rabbit/SKILL.md`](../skills/rabbit/SKILL.md) describes how to use rabbit and manage bindings. Copy it to `~/.claude/skills/rabbit/`.
+## AI agents
+
+rabbit carries a skill for AI agents ([`internal/skill/SKILL.md`](internal/skill/SKILL.md)) that describes how to use it and
+manage bindings:
+
+```sh
+rabbit skill install            # into ~/.claude/skills/ ($CLAUDE_CONFIG_DIR if set) and ~/.agents/skills/ (Codex,
+                                # Gemini CLI, Copilot, OpenCode), each only if ~/.claude or ~/.agents exists; rerun after upgrading
+rabbit skill install --dir DIR  # another agent's skill directory
+rabbit skill print              # to stdout
+```
 
 ## Other variables
 
