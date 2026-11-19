@@ -121,6 +121,8 @@ See [`.env.example`](.env.example) for a full template.
 
 ### rabbit CLI and CI federation
 
+The Go command-line client is in [`cli/`](cli/README.md) (install, usage, CI examples in [`examples/ci`](examples/ci)). The server side:
+
 The `rabbit` CLI never holds a real bunny.net key. It exchanges an identity token for a White Rabbit session, then
 asks for short-lived **virtual credentials** that only White Rabbit's proxy accepts.
 
