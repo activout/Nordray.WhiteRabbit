@@ -4,6 +4,8 @@ namespace Nordray.WhiteRabbit.Core.Federation;
 
 /// <summary>
 /// Which CI identities a workload binding accepts. Every compared value must match exactly; there are no patterns.
+/// A binding without a ref accepts any branch or tag. Its workflow is then <c>&lt;repository&gt;/&lt;path&gt;</c>, and the
+/// repository's own protections (who may push which refs, GitHub environments) decide which refs are trusted.
 /// </summary>
 public static class BindingRules
 {
@@ -57,8 +59,10 @@ public static class BindingRules
     {
         if (!string.Equals(b.Issuer, id.IssuerName, StringComparison.Ordinal)) return false;
         if (!string.Equals(b.Repository, id.Repository, StringComparison.Ordinal)) return false;
-        if (!string.Equals(b.Ref, id.Ref, StringComparison.Ordinal)) return false;
-        if (!string.Equals(b.WorkflowRef, id.WorkflowRef, StringComparison.Ordinal)) return false;
+        // CheckIdentity has made sure the identity's workflow_ref ends with "@" + its ref.
+        var workflowRef = b.Ref.Length == 0 ? b.WorkflowRef + "@" + id.Ref : b.WorkflowRef;
+        if (b.Ref.Length > 0 && !string.Equals(b.Ref, id.Ref, StringComparison.Ordinal)) return false;
+        if (!string.Equals(workflowRef, id.WorkflowRef, StringComparison.Ordinal)) return false;
         if (!NameList.Parse(b.EventNames).Contains(id.EventName!)) return false;
 
         if (id.IssuerKind == IssuerKind.GitHub)
@@ -77,9 +81,13 @@ public static class BindingRules
     {
         var errors = new List<string>();
         if (!IsRepositoryName(b.Repository)) errors.Add("repository must be owner/name");
-        if (!IsBranchOrTag(b.Ref)) errors.Add("ref must start with refs/heads/ or refs/tags/");
-        if (!b.WorkflowRef.StartsWith(b.Repository + "/", StringComparison.Ordinal) || !b.WorkflowRef.EndsWith("@" + b.Ref, StringComparison.Ordinal))
-            errors.Add("workflow_ref must be <repository>/<workflow path>@<ref>");
+        if (b.Ref.Length > 0 && !IsBranchOrTag(b.Ref)) errors.Add("ref must start with refs/heads/ or refs/tags/, or be empty for any ref");
+        var workflowPath = b.Ref.Length > 0 && b.WorkflowRef.EndsWith("@" + b.Ref, StringComparison.Ordinal)
+            ? b.WorkflowRef[..^(b.Ref.Length + 1)]
+            : b.WorkflowRef;
+        if (!workflowPath.StartsWith(b.Repository + "/", StringComparison.Ordinal) || workflowPath.Length == b.Repository.Length + 1
+            || workflowPath.Contains('@') || (b.Ref.Length > 0 && workflowPath == b.WorkflowRef))
+            errors.Add("workflow_ref must be <repository>/<workflow path>@<ref>, or <repository>/<workflow path> without a ref");
 
         var events = NameList.Parse(b.EventNames);
         if (events.Count == 0) errors.Add("at least one event is required");

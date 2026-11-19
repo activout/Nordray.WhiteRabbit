@@ -17,7 +17,9 @@ public sealed record WorkloadBinding
     public string Repository { get; init; } = "";
     public string? RepositoryId { get; init; }
     public string? RepositoryOwnerId { get; init; }
+    /// <summary>Exact branch or tag, or empty for any ref.</summary>
     public string Ref { get; init; } = "";
+    /// <summary><c>&lt;repository&gt;/&lt;path&gt;@&lt;ref&gt;</c>, or <c>&lt;repository&gt;/&lt;path&gt;</c> when Ref is empty.</summary>
     public string WorkflowRef { get; init; } = "";
     public string? JobWorkflowRef { get; init; }
     public string? Environment { get; init; }
