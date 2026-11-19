@@ -75,7 +75,7 @@ With several environments and none selected, rabbit refuses to guess. Interactiv
 |---|---|---|
 | Job setting | `permissions: id-token: write` | `enable-openid-connect: true` on the job (`permissions` has no effect) |
 | Detected by | `GITHUB_ACTIONS=true` | `FORGEJO_ACTIONS=true` |
-| Binding matches | repository ID, ref, workflow, events (optionally owner ID, environment, reusable workflow) | repository name, ref, workflow, events |
+| Binding matches | repository ID, workflow, events (optionally ref, owner ID, environment, reusable workflow) | repository name, workflow, events (optionally ref) |
 
 Set `RABBIT_SERVER`. The token audience comes from the server (`/api/cli/config`). Pull-request events can never obtain a credential. A human creates the binding once:
 
@@ -85,6 +85,9 @@ rabbit admin bindings add --issuer github --repository acme/app --repository-id 
 rabbit admin bindings list
 rabbit admin bindings rm 3
 ```
+
+Leave out `--ref` to accept the workflow from any branch or tag (e.g. release tags). Then protect the refs that can
+run it in the repository: who may push them, rulesets, or a protected GitHub environment (`--environment`).
 
 See [`examples/ci`](../examples/ci) for complete workflows.
 
