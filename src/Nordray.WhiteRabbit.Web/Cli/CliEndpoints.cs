@@ -84,7 +84,8 @@ public static class CliEndpoints
         IOptions<CliOptions> cliOptions,
         SecurityAudit audit)
     {
-        var request = await ReadJsonAsync<ExchangeRequest>(ctx);
+        var (request, invalid) = await ReadJsonAsync<ExchangeRequest>(ctx);
+        if (invalid is not null) return invalid;
         if (string.IsNullOrWhiteSpace(request?.SubjectToken))
             return Error(StatusCodes.Status400BadRequest, "invalid_request", "subject_token is required");
 
@@ -196,7 +197,8 @@ public static class CliEndpoints
         var (principal, denied) = await ResolveAsync(ctx, resolver, audit, "cli.credential", now);
         if (principal is null) return denied!;
 
-        var request = await ReadJsonAsync<CredentialRequest>(ctx);
+        var (request, invalid) = await ReadJsonAsync<CredentialRequest>(ctx);
+        if (invalid is not null) return invalid;
         var requested = request?.Capabilities is { Length: > 0 } list ? list.ToHashSet(StringComparer.Ordinal) : principal.Capabilities.ToHashSet(StringComparer.Ordinal);
         var missing = requested.Where(c => !principal.Capabilities.Contains(c)).Order(StringComparer.Ordinal).ToList();
         if (missing.Count > 0)
@@ -248,7 +250,8 @@ public static class CliEndpoints
         HttpContext ctx, ICliSessionDao sessions, IVirtualCredentialDao credentials, SecurityAudit audit)
     {
         var session = CliSessionAuthenticationHandler.SessionOf(ctx)!;
-        var request = await ReadJsonAsync<RevokeRequest>(ctx);
+        var (request, invalid) = await ReadJsonAsync<RevokeRequest>(ctx);
+        if (invalid is not null) return invalid;
         var now = DateTime.UtcNow;
         var describe = new SecurityEvent
         {
@@ -293,10 +296,12 @@ public static class CliEndpoints
         string[]? Capabilities,
         string? Description);
 
-    private static async Task<IResult> ListBindings(HttpContext ctx, IWorkloadBindingDao bindings)
+    private static async Task<IResult> ListBindings(
+        HttpContext ctx, IWorkloadBindingDao bindings, CliPrincipalResolver resolver, SecurityAudit audit)
     {
-        var session = CliSessionAuthenticationHandler.SessionOf(ctx)!;
-        return Results.Json((await bindings.ListActiveByOwnerAsync(session.UserId)).Select(DescribeBinding), Json);
+        var (principal, denied) = await ResolveAsync(ctx, resolver, audit, "admin.binding.list", DateTime.UtcNow);
+        if (principal is null) return denied!;
+        return Results.Json((await bindings.ListActiveByOwnerAsync(principal.Owner.Id)).Select(DescribeBinding), Json);
     }
 
     private static async Task<IResult> CreateBinding(
@@ -310,7 +315,8 @@ public static class CliEndpoints
         var (principal, denied) = await ResolveAsync(ctx, resolver, audit, "admin.binding.create", DateTime.UtcNow);
         if (principal is null) return denied!;
 
-        var request = await ReadJsonAsync<BindingRequest>(ctx);
+        var (request, invalid) = await ReadJsonAsync<BindingRequest>(ctx);
+        if (invalid is not null) return invalid;
         var issuer = federation.Value.Issuers.FirstOrDefault(i => string.Equals(i.Name, request?.Issuer, StringComparison.Ordinal));
         if (request is null || issuer is null)
             return Error(StatusCodes.Status400BadRequest, "invalid_request",
@@ -427,18 +433,30 @@ public static class CliEndpoints
         b.CreatedUtc,
     };
 
-    private static async Task<T?> ReadJsonAsync<T>(HttpContext ctx) where T : class
+    /// <summary>
+    /// Reads an optional JSON body. No body at all gives (null, null), and the caller applies its defaults. A body
+    /// that is present but not JSON, malformed or of the wrong shape is a 400/415 error, never treated as empty:
+    /// a broken revoke request must not revoke the whole session.
+    /// </summary>
+    private static async Task<(T? Value, IResult? Error)> ReadJsonAsync<T>(HttpContext ctx) where T : class
     {
-        // No body, or a body that is not JSON: treated as an empty request (all fields optional or checked by the caller).
-        if (ctx.Request.ContentLength is 0 || !ctx.Request.HasJsonContentType())
-            return null;
+        var request = ctx.Request;
+        var hasBody = request.ContentLength is > 0
+            || (request.ContentLength is null && (request.Headers.TransferEncoding.Count > 0 || request.ContentType is not null));
+        if (!hasBody)
+            return (null, null);
+        if (!request.HasJsonContentType())
+            return (null, Error(StatusCodes.Status415UnsupportedMediaType, "invalid_request", "the body must be application/json"));
         try
         {
-            return await ctx.Request.ReadFromJsonAsync<T>(Json, ctx.RequestAborted);
+            var value = await request.ReadFromJsonAsync<T>(Json, ctx.RequestAborted);
+            return value is null
+                ? (null, Error(StatusCodes.Status400BadRequest, "invalid_request", "the body must be a JSON object"))
+                : (value, null);
         }
         catch (JsonException)
         {
-            return null;
+            return (null, Error(StatusCodes.Status400BadRequest, "invalid_request", "the body is not valid JSON for this request"));
         }
     }
 

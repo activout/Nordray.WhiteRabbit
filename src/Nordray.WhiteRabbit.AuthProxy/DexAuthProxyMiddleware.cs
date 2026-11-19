@@ -34,6 +34,16 @@ public sealed class DexAuthProxyMiddleware(RequestDelegate next)
         context.Request.Headers.Remove("X-Remote-Groups");
         context.Request.Headers.Remove("X-Remote-Extra");
 
+        // RFC 6749 §3.1: request parameters must not be repeated. White Rabbit and Dex could otherwise read different
+        // values (e.g. client_id=rabbit-cli&client_id=other), letting a request slip past the checks below.
+        if (HasRepeatedAuthorizationParameter(context))
+        {
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            context.Response.ContentType = "text/plain";
+            await context.Response.WriteAsync("Authorization request parameters must not be repeated.");
+            return;
+        }
+
         if (IsPublicClientRequestWithoutPkce(context))
         {
             context.Response.StatusCode = StatusCodes.Status400BadRequest;
@@ -80,6 +90,12 @@ public sealed class DexAuthProxyMiddleware(RequestDelegate next)
 
         await next(context);
     }
+
+    private static readonly string[] AuthorizationParameters =
+        ["client_id", "response_type", "redirect_uri", "scope", "state", "nonce", "code_challenge", "code_challenge_method", "prompt"];
+
+    private static bool HasRepeatedAuthorizationParameter(HttpContext context) =>
+        AuthorizationParameters.Any(name => context.Request.Query[name].Count > 1);
 
     private static bool IsPublicClientRequestWithoutPkce(HttpContext context)
     {
