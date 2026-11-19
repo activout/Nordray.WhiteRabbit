@@ -3,15 +3,13 @@ name: Server image
 # Publishes the generic White Rabbit server image to ghcr.io/activout/nordray-whiterabbit:
 #   - every push to main: :sha-<commit> and :main
 #   - every v* tag:       :<tag> (e.g. :v0.1.0) and :latest
-# Pull requests build the image without pushing it.
+# Pull requests are validated by pr.yml.
 # Operators deploy a pinned digest, never a moving tag.
 
 on:
   push:
     branches: [main]
     tags: ["v*"]
-    paths-ignore: ["cli/**", "**.md"]
-  pull_request:
     paths-ignore: ["cli/**", "**.md"]
   workflow_dispatch:
 
@@ -20,21 +18,13 @@ permissions:
 
 concurrency:
   group: image-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   IMAGE: ghcr.io/activout/nordray-whiterabbit
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
-        with:
-          dotnet-version: "10.0.x"
-      - run: dotnet test
-      - run: dotnet list package --vulnerable --include-transitive
+    uses: ./.github/workflows/server-test.yml
 
   publish:
     needs: test
@@ -60,7 +50,6 @@ jobs:
 
       - name: Push
         id: push
-        if: github.event_name != 'pull_request'
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -85,7 +74,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Attest published image
-        if: github.event_name != 'pull_request'
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ${{ env.IMAGE }}

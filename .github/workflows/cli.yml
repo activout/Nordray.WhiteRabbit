@@ -4,37 +4,14 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-    paths: ["cli/**", ".github/workflows/cli.yml"]
-  pull_request:
-    paths: ["cli/**", ".github/workflows/cli.yml"]
+    paths: ["cli/**", ".github/workflows/cli.yml", ".github/workflows/cli-test.yml"]
 
 permissions:
   contents: read
 
-concurrency:
-  group: cli-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
   test:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: cli
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: cli/go.mod
-          cache-dependency-path: cli/go.sum
-      - run: go mod verify
-      - run: go vet ./...
-      - run: go test -race ./...
-      - name: Cross-compile
-        run: |
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
-            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -o /dev/null ./cmd/rabbit
-          done
+    uses: ./.github/workflows/cli-test.yml
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
