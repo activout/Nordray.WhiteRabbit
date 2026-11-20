@@ -94,4 +94,14 @@ public interface ISecurityEventDao
                 @OperationId, @HttpMethod, @Path, @HttpStatus, @UpstreamStatus, @CorrelationId, @Detail)
         """)]
     Task InsertAsync([BindProperties] SecurityEvent securityEvent);
+
+    /// <summary>The owner's events since a time, newest first; optionally only one binding's.</summary>
+    [SqlQuery("""
+        SELECT * FROM SecurityEvents
+        WHERE UserId = @userId AND OccurredUtc >= @since AND (@bindingId IS NULL OR BindingId = @bindingId)
+        ORDER BY Id DESC
+        LIMIT @limit
+        """)]
+    Task<IEnumerable<SecurityEvent>> ListForOwnerAsync(
+        [Bind("userId")] long userId, [Bind("since")] DateTime since, [Bind("bindingId")] long? bindingId, [Bind("limit")] int limit);
 }

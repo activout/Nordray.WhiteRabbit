@@ -65,6 +65,9 @@ func fakeBunny(args []string) int {
 // storedKey is what the fake server last received at /api/admin/bunny-key ("PUT key" or "DELETE ").
 var storedKey string
 
+// auditQuery is the query string of the last /api/admin/audit request.
+var auditQuery url.Values
+
 // requestedCapabilities is what the last /api/cli/credentials request asked for.
 var requestedCapabilities string
 
@@ -141,6 +144,16 @@ func fakeWhiteRabbit(t *testing.T) *httptest.Server {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"type": kind, "email": map[bool]string{true: "me@example.com"}[kind == "human"],
 			"repository": "acme/app", "capabilities": []string{"statistics.read"}, "session_expires_at": time.Now().Add(time.Hour)})
+	})
+	mux.HandleFunc("/api/admin/audit", func(w http.ResponseWriter, r *http.Request) {
+		if authed(r) != "human" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		auditQuery = r.URL.Query()
+		_, _ = io.WriteString(w, `[
+		  {"id":2,"occurred_utc":"2026-11-20T10:05:00Z","event_type":"proxy.request","outcome":"allowed","repository":"acme/app","binding_id":7,"operation_id":"core.statistics.get","http_status":200,"upstream_status":200},
+		  {"id":1,"occurred_utc":"2026-11-20T10:00:00Z","event_type":"cli.exchange","outcome":"denied","reason":"no_matching_binding","principal_type":"github_workload","http_status":401}]`)
 	})
 	mux.HandleFunc("/proxy/api.bunny.net/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("AccessKey") != "wrk_test" {
@@ -456,5 +469,34 @@ func TestPassthrough_RabbitCapabilitiesNarrowsTheCredential(t *testing.T) {
 	}
 	if code := h.run("--capabilities=dns.read,dns.write", "--", "call", "/statistics"); code != 0 || requestedCapabilities != "dns.read,dns.write" {
 		t.Fatalf("exit %d, requested %q: %s", code, requestedCapabilities, h.stderr)
+	}
+}
+
+func TestAdminAudit_PrintsOldestFirstAndPassesFilters(t *testing.T) {
+	h := newHarness(t)
+	_ = h.app.Secrets.Set(h.server.URL, secrets.Session{Token: "wrs_human", ExpiresAt: time.Now().Add(time.Hour)})
+	before := time.Now()
+	if code := h.run("admin", "audit", "--since", "7d", "--binding", "7", "--limit", "10"); code != 0 {
+		t.Fatalf("exit %d: %s", code, h.stderr)
+	}
+	since, _ := time.Parse(time.RFC3339, auditQuery.Get("since"))
+	if d := before.Sub(since); d < 7*24*time.Hour-time.Minute || d > 7*24*time.Hour+time.Minute {
+		t.Fatalf("since %v is not 7 days back", since)
+	}
+	if auditQuery.Get("binding_id") != "7" || auditQuery.Get("limit") != "10" {
+		t.Fatalf("query %v", auditQuery)
+	}
+	out := h.stdout.String()
+	exchange, proxy := strings.Index(out, "cli.exchange"), strings.Index(out, "proxy.request")
+	if exchange < 0 || proxy < exchange || !strings.Contains(out, "no_matching_binding") || !strings.Contains(out, "acme/app #7") {
+		t.Fatalf("unexpected output:\n%s", out)
+	}
+
+	h.stdout.Reset()
+	if code := h.run("admin", "audit", "--json"); code != 0 || !strings.Contains(h.stdout.String(), `"event_type": "proxy.request"`) {
+		t.Fatalf("exit %d: %s", code, h.stdout)
+	}
+	if code := h.run("admin", "audit", "--since", "yesterday"); code != 2 {
+		t.Fatal("a bad --since must be a usage error")
 	}
 }

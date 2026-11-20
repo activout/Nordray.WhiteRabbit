@@ -85,6 +85,7 @@ rabbit admin bindings add --issuer github --repository acme/app --repository-id 
   --ref refs/heads/main --workflow .github/workflows/deploy.yml --capability pullzone.read
 rabbit admin bindings list
 rabbit admin bindings rm 3
+rabbit admin audit --since 7d --binding 3   # what that workflow did, oldest first; --json for everything
 ```
 
 Leave out `--ref` to accept the workflow from any branch or tag (e.g. release tags). Then protect the refs that can
