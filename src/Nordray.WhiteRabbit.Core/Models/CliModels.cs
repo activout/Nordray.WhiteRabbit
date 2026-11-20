@@ -79,6 +79,7 @@ public sealed record VirtualCredential
 /// <summary>One row of the security audit trail. Never put tokens, keys, codes or query strings in it.</summary>
 public sealed record SecurityEvent
 {
+    public long Id { get; init; }
     public DateTime OccurredUtc { get; init; } = DateTime.UtcNow;
     public required string EventType { get; init; }
     public required string Outcome { get; init; }

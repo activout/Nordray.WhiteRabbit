@@ -48,6 +48,8 @@ public static class CliEndpoints
         admin.MapPost("/", CreateBinding);
         admin.MapDelete("/{id:long}", RevokeBinding);
 
+        app.MapGet("/api/admin/audit", ListAudit).RequireAuthorization(HumanPolicy).RequireRateLimiting(ApiRateLimit);
+
         var key = app.MapGroup("/api/admin/bunny-key").RequireAuthorization(HumanPolicy).RequireRateLimiting(ApiRateLimit);
         key.MapPut("/", SetBunnyKey);
         key.MapDelete("/", RemoveBunnyKey);
@@ -385,6 +387,31 @@ public static class CliEndpoints
             Detail = JsonSerializer.Serialize(new { before = DescribeBinding(before) }, Json),
         });
         return Results.NoContent();
+    }
+
+    // ---------------------------------------------------------------- admin: audit
+
+    public const int MaxAuditEvents = 500;
+
+    /// <summary>
+    /// The caller's own security events: everything recorded with them as the owner, including their CI workloads'
+    /// exchanges and proxy calls. Events with no known owner (e.g. a token from an untrusted issuer) are not included.
+    /// </summary>
+    private static async Task<IResult> ListAudit(
+        HttpContext ctx, ISecurityEventDao events, CliPrincipalResolver resolver, SecurityAudit audit,
+        [Microsoft.AspNetCore.Mvc.FromQuery(Name = "since")] DateTime? since,
+        [Microsoft.AspNetCore.Mvc.FromQuery(Name = "binding_id")] long? bindingId,
+        [Microsoft.AspNetCore.Mvc.FromQuery(Name = "limit")] int? limit)
+    {
+        var now = DateTime.UtcNow;
+        var (principal, denied) = await ResolveAsync(ctx, resolver, audit, "admin.audit.list", now);
+        if (principal is null) return denied!;
+        if (limit is < 1 or > MaxAuditEvents)
+            return Error(StatusCodes.Status400BadRequest, "invalid_request", $"limit must be 1-{MaxAuditEvents}");
+
+        var from = since?.ToUniversalTime() ?? now.AddHours(-24);
+        var list = await events.ListForOwnerAsync(principal.Owner.Id, from, bindingId, limit ?? 50);
+        return Results.Json(list.Select(e => e with { UserId = null }), Json);
     }
 
     // ---------------------------------------------------------------- admin: Bunny API key

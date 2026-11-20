@@ -146,6 +146,8 @@ White Rabbit commands:
   env list | add NAME URL | use NAME | remove NAME Manage White Rabbit servers
   admin key set | rm                               Store or remove your bunny.net API key (read from stdin)
   admin bindings list | add ... | rm ID            Manage CI workload bindings (interactive session only)
+  admin audit [--since 24h] [--binding ID] [--limit N] [--json]
+                                                   Show your security events, including your CI workloads
   skill install [--dir DIR] | print                Install the AI agent skill (~/.claude/skills, ~/.agents/skills)
   version
 
@@ -183,16 +185,22 @@ func (a *App) command(ctx context.Context, envFlag, serverFlag, name string, arg
 		}
 		return 2, usageError{"unknown auth subcommand " + args[0]}
 	case "admin":
-		if len(args) < 2 || (args[0] != "bindings" && args[0] != "key") {
-			return 2, usageError{"usage: rabbit admin key set | rm, or rabbit admin bindings list | add ... | rm ID"}
+		const adminUsage = "usage: rabbit admin key set | rm, rabbit admin bindings list | add ... | rm ID, or rabbit admin audit [...]"
+		if len(args) == 0 || (args[0] != "audit" && len(args) < 2) {
+			return 2, usageError{adminUsage}
 		}
 		if err := a.selectEnv(envFlag, serverFlag); err != nil {
 			return 1, err
 		}
-		if args[0] == "key" {
+		switch args[0] {
+		case "audit":
+			return a.audit(ctx, args[1:])
+		case "key":
 			return a.bunnyKey(ctx, args[1], args[2:])
+		case "bindings":
+			return a.bindings(ctx, args[1], args[2:])
 		}
-		return a.bindings(ctx, args[1], args[2:])
+		return 2, usageError{adminUsage}
 	case "skill":
 		return a.skillCommand(args)
 	}
@@ -585,6 +593,94 @@ func (a *App) readSecret(prompt string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(line), nil
+}
+
+// ---------------------------------------------------------------- admin audit
+
+func (a *App) audit(ctx context.Context, args []string) (int, error) {
+	fs := flag.NewFlagSet("admin audit", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	since := fs.String("since", "24h", "how far back, e.g. 30m, 24h or 7d")
+	binding := fs.Int64("binding", 0, "only this binding's events")
+	limit := fs.Int("limit", 50, "at most this many events (1-500), the newest")
+	asJSON := fs.Bool("json", false, "print JSON")
+	if err := fs.Parse(args); err != nil {
+		return 2, usageError{err.Error()}
+	}
+	back, err := parseAge(*since)
+	if err != nil {
+		return 2, usageError{err.Error()}
+	}
+	if p, _ := a.ciPlatform(); p != ci.None {
+		return 1, errors.New("the audit log can only be read from an interactive session, not from CI")
+	}
+	if !*asJSON {
+		a.announce()
+	}
+	token, err := a.session(ctx)
+	if err != nil {
+		return 1, err
+	}
+	events, err := a.client().Audit(ctx, token, time.Now().Add(-back), *binding, *limit)
+	if err != nil {
+		return 1, err
+	}
+	if *asJSON {
+		enc := json.NewEncoder(a.Stdout)
+		enc.SetIndent("", "  ")
+		return 0, enc.Encode(events)
+	}
+	if len(events) == 0 {
+		fmt.Fprintln(a.Stdout, "No events.")
+	}
+	// Oldest first, like a log; the server returns the newest first.
+	for i := len(events) - 1; i >= 0; i-- {
+		e := events[i]
+		line := fmt.Sprintf("%s  %-7s %-22s", e.OccurredUtc.Local().Format("2006-01-02 15:04:05"), e.Outcome, e.EventType)
+		for _, part := range []string{e.Reason, who(e), e.OperationId, status(e)} {
+			if part != "" {
+				line += "  " + part
+			}
+		}
+		fmt.Fprintln(a.Stdout, line)
+	}
+	return 0, nil
+}
+
+// parseAge accepts Go durations plus whole days ("7d").
+func parseAge(s string) (time.Duration, error) {
+	if days, ok := strings.CutSuffix(s, "d"); ok {
+		if n, err := strconv.Atoi(days); err == nil && n > 0 {
+			return time.Duration(n) * 24 * time.Hour, nil
+		}
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("--since must be a duration such as 30m, 24h or 7d, not %q", s)
+	}
+	return d, nil
+}
+
+func who(e api.AuditEvent) string {
+	switch {
+	case e.Repository != "" && e.BindingId != nil:
+		return fmt.Sprintf("%s #%d", e.Repository, *e.BindingId)
+	case e.Repository != "":
+		return e.Repository
+	default:
+		return e.PrincipalType
+	}
+}
+
+func status(e api.AuditEvent) string {
+	switch {
+	case e.HttpStatus == nil:
+		return ""
+	case e.UpstreamStatus != nil && *e.UpstreamStatus != *e.HttpStatus:
+		return fmt.Sprintf("%d (bunny %d)", *e.HttpStatus, *e.UpstreamStatus)
+	default:
+		return strconv.Itoa(*e.HttpStatus)
+	}
 }
 
 // ---------------------------------------------------------------- admin bindings

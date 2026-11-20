@@ -76,6 +76,9 @@ Not possible through rabbit:
 | CI: 401 `no_matching_binding` | No binding matches the job's repository, ref, workflow or event |
 | CI: 401 `event_not_allowed` | A `pull_request` job. These never get a credential, by design |
 
+`rabbit admin audit --since 1h` (interactive session only) shows what was allowed or denied, with the reason, for the
+user and their CI bindings. A CI exchange denied as `no_matching_binding` has no owner yet, so it is not listed.
+
 BunnyCLI 0.22.0 drops the `/mc` and `/database` prefixes under `BUNNYNET_API_URL`. rabbit's forwarder restores them,
 so this is not an error, but `bunny api` calls must include the prefix (`api GET /mc/apps`).
 

@@ -157,6 +157,7 @@ session, then asks for short-lived **virtual credentials** that only White Rabbi
 | `GET /api/cli/whoami` | session | The authenticated human or workload and its current capabilities |
 | `POST /api/cli/revoke` `{"credential_id": "…"?}` | session | Revokes one credential, or the session and all its credentials |
 | `GET/POST /api/admin/bindings`, `DELETE /api/admin/bindings/{id}` | human session only | Lists, creates and revokes the caller's own CI workload bindings |
+| `GET /api/admin/audit?since=&binding_id=&limit=` | human session only | The caller's own security events, newest first (default: last 24 hours, 50 events, at most 500) |
 | `PUT /api/admin/bunny-key` `{"api_key": "…"}`, `DELETE /api/admin/bunny-key` | human session only | Stores (encrypted) or removes the caller's bunny.net API key. Never returned; `whoami` only says `has_bunny_key` |
 
 - **Sessions and virtual credentials** are opaque random tokens; only their SHA-256 hashes are stored. They are checked on every use against the sign-in allow-list and, for CI, the workload binding, so revoking either takes effect immediately.
@@ -183,6 +184,8 @@ Security events (`SecurityEvents` table and the structured log) record CLI sign-
 - status, upstream status and correlation ID.
 
 Tokens, keys, codes and request bodies are never recorded. Send `X-Correlation-ID` to correlate a request; it is echoed in the response.
+
+Read your own events with `rabbit admin audit` (`--since 7d`, `--binding ID`, `--limit N`, `--json`). It shows everything recorded with you as the owner, including your CI workloads' exchanges and proxy calls. Denials where no owner is known yet, such as a token from an untrusted issuer or for a repository without a binding, are only in the table and the log.
 
 ### Health
 

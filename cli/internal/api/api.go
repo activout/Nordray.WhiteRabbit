@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -183,6 +185,42 @@ func (c *Client) SetBunnyKey(ctx context.Context, session, apiKey string) error 
 
 func (c *Client) RemoveBunnyKey(ctx context.Context, session string) error {
 	return c.do(ctx, http.MethodDelete, "/api/admin/bunny-key", session, nil, nil)
+}
+
+// AuditEvent is one entry of GET /api/admin/audit.
+type AuditEvent struct {
+	Id             int64     `json:"id"`
+	OccurredUtc    time.Time `json:"occurred_utc"`
+	EventType      string    `json:"event_type"`
+	Outcome        string    `json:"outcome"`
+	Reason         string    `json:"reason,omitempty"`
+	PrincipalType  string    `json:"principal_type,omitempty"`
+	Subject        string    `json:"subject,omitempty"`
+	Issuer         string    `json:"issuer,omitempty"`
+	BindingId      *int64    `json:"binding_id,omitempty"`
+	SessionId      string    `json:"session_id,omitempty"`
+	CredentialId   string    `json:"credential_id,omitempty"`
+	Repository     string    `json:"repository,omitempty"`
+	WorkflowRef    string    `json:"workflow_ref,omitempty"`
+	Ref            string    `json:"ref,omitempty"`
+	RunId          string    `json:"run_id,omitempty"`
+	OperationId    string    `json:"operation_id,omitempty"`
+	HttpMethod     string    `json:"http_method,omitempty"`
+	Path           string    `json:"path,omitempty"`
+	HttpStatus     *int      `json:"http_status,omitempty"`
+	UpstreamStatus *int      `json:"upstream_status,omitempty"`
+	CorrelationId  string    `json:"correlation_id,omitempty"`
+	Detail         string    `json:"detail,omitempty"`
+}
+
+// Audit lists the caller's own security events since a time, newest first. bindingId 0 means all.
+func (c *Client) Audit(ctx context.Context, session string, since time.Time, bindingId int64, limit int) ([]AuditEvent, error) {
+	q := url.Values{"since": {since.UTC().Format(time.RFC3339)}, "limit": {strconv.Itoa(limit)}}
+	if bindingId != 0 {
+		q.Set("binding_id", strconv.FormatInt(bindingId, 10))
+	}
+	var out []AuditEvent
+	return out, c.do(ctx, http.MethodGet, "/api/admin/audit?"+q.Encode(), session, nil, &out)
 }
 
 // ProblemsError carries a rejected binding's problems.

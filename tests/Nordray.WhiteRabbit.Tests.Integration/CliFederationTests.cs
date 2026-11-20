@@ -1079,3 +1079,66 @@ public class CliFederationBunnyKeyTests : CliFederationTests
         Assert.True((await GetJsonAsync("/api/cli/whoami", workload)).GetProperty("has_bunny_key").GetBoolean());
     }
 }
+
+public class CliFederationAuditTests : CliFederationTests
+{
+    [Fact]
+    public async Task Audit_ListsTheOwnersEventsIncludingTheirWorkloads_NewestFirst()
+    {
+        var human = await HumanSessionAsync();
+        var (_, created) = await CreateBindingAsync(human, GitHubBinding());
+        var workload = (await ExchangeAsync(GitHubToken())).Body.GetProperty("access_token").GetString()!;
+        await ProxyAsync(await CredentialAsync(workload), "/proxy/api.bunny.net/statistics");
+
+        var events = (await GetJsonAsync("/api/admin/audit", human)).EnumerateArray().ToList();
+
+        var types = events.Select(e => e.GetProperty("event_type").GetString()).ToList();
+        Assert.Equal("proxy.request", types[0]);
+        Assert.Contains("admin.binding.create", types);
+        Assert.Contains("cli.exchange", types);
+        var proxy = events[0];
+        Assert.Equal("activout/rabbit-ci-test", proxy.GetProperty("repository").GetString());
+        Assert.Equal(created.GetProperty("id").GetInt64(), proxy.GetProperty("binding_id").GetInt64());
+        Assert.False(proxy.TryGetProperty("user_id", out _));
+        Assert.True(events.Select(e => e.GetProperty("id").GetInt64()).SequenceEqual(events.Select(e => e.GetProperty("id").GetInt64()).OrderDescending()));
+    }
+
+    [Fact]
+    public async Task Audit_FiltersByBindingSinceAndLimit()
+    {
+        var human = await HumanSessionAsync();
+        var (_, created) = await CreateBindingAsync(human, GitHubBinding());
+        var bindingId = created.GetProperty("id").GetInt64();
+        await ExchangeAsync(GitHubToken());
+
+        var byBinding = (await GetJsonAsync($"/api/admin/audit?binding_id={bindingId}", human)).EnumerateArray().ToList();
+        Assert.NotEmpty(byBinding);
+        Assert.All(byBinding, e => Assert.Equal(bindingId, e.GetProperty("binding_id").GetInt64()));
+
+        Assert.Single((await GetJsonAsync("/api/admin/audit?limit=1", human)).EnumerateArray());
+        var future = Uri.EscapeDataString(DateTime.UtcNow.AddMinutes(5).ToString("O"));
+        Assert.Empty((await GetJsonAsync($"/api/admin/audit?since={future}", human)).EnumerateArray());
+
+        Assert.Equal(HttpStatusCode.BadRequest, (await SendAsync(HttpMethod.Get, "/api/admin/audit?limit=0", human)).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, (await SendAsync(HttpMethod.Get, "/api/admin/audit?limit=501", human)).StatusCode);
+    }
+
+    [Fact]
+    public async Task Audit_ShowsOnlyTheCallersOwnEvents()
+    {
+        var human = await HumanSessionAsync();
+        await CreateBindingAsync(human, GitHubBinding());
+        var other = await HumanSessionAsync("other@" + WhiteRabbitFactory.AllowedDomain);
+
+        var events = (await GetJsonAsync("/api/admin/audit", other)).EnumerateArray().ToList();
+        Assert.DoesNotContain(events, e => e.GetProperty("event_type").GetString() == "admin.binding.create");
+    }
+
+    [Fact]
+    public async Task Audit_WorkloadSessionCannotReadIt()
+    {
+        await CreateBindingAsync(await HumanSessionAsync(), GitHubBinding());
+        var workload = (await ExchangeAsync(GitHubToken())).Body.GetProperty("access_token").GetString()!;
+        Assert.Equal(HttpStatusCode.Forbidden, (await SendAsync(HttpMethod.Get, "/api/admin/audit", workload)).StatusCode);
+    }
+}

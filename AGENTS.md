@@ -254,6 +254,7 @@ POST /api/cli/revoke            revoke a credential, or the session and its cred
 GET|POST /api/admin/bindings    human session only: list/create own workload bindings
 DELETE /api/admin/bindings/{id} human session only: revoke own binding
 PUT|DELETE /api/admin/bunny-key human session only: store/remove own bunny.net API key (never returned)
+GET  /api/admin/audit           human session only: own SecurityEvents (since, binding_id, limit ≤ 500)
 GET  /health   process liveness
 GET  /ready    database reachable and all migrations applied (503 otherwise)
 ```
