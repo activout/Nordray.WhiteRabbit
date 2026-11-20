@@ -39,7 +39,7 @@ GitHub / Forgejo Actions job            you, at a terminal
    key is injected and the request is forwarded to `https://api.bunny.net`.
 
 The same `rabbit -- …` works at your own terminal, so an AI agent can run BunnyCLI without ever seeing the key
-(`RABBIT_CAPABILITIES=a,b` limits what it may do).
+(`rabbit --capabilities a,b -- …` limits what it may do).
 
 ## Supported bunny.net APIs
 

@@ -450,4 +450,11 @@ func TestPassthrough_RabbitCapabilitiesNarrowsTheCredential(t *testing.T) {
 	if code := h.run("--", "call", "/statistics"); code != 0 || requestedCapabilities != "mc.read,db.read" {
 		t.Fatalf("exit %d, requested %q: %s", code, requestedCapabilities, h.stderr)
 	}
+	// The flag wins over the variable.
+	if code := h.run("--capabilities", "statistics.read", "--", "call", "/statistics"); code != 0 || requestedCapabilities != "statistics.read" {
+		t.Fatalf("exit %d, requested %q: %s", code, requestedCapabilities, h.stderr)
+	}
+	if code := h.run("--capabilities=dns.read,dns.write", "--", "call", "/statistics"); code != 0 || requestedCapabilities != "dns.read,dns.write" {
+		t.Fatalf("exit %d, requested %q: %s", code, requestedCapabilities, h.stderr)
+	}
 }

@@ -45,10 +45,11 @@ type App struct {
 	StderrIsTTY    bool
 	Self           string // this executable, so RABBIT_BUNNY cannot point at it
 
-	selected config.Selected
-	ciOnce   sync.Once
-	ciToken  string
-	ciErr    error
+	selected     config.Selected
+	capabilities string // --capabilities; wins over RABBIT_CAPABILITIES
+	ciOnce       sync.Once
+	ciToken      string
+	ciErr        error
 }
 
 // New returns an App wired to the real process.
@@ -96,16 +97,21 @@ func (a *App) run(ctx context.Context, args []string) (int, error) {
 		switch {
 		case arg == "--":
 			return a.passthrough(ctx, envFlag, serverFlag, args[i+1:])
-		case arg == "--env" || arg == "--server":
+		case arg == "--env" || arg == "--server" || arg == "--capabilities":
 			if i+1 >= len(args) {
 				return 2, usageError{arg + " needs a value"}
 			}
-			if arg == "--env" {
+			switch arg {
+			case "--env":
 				envFlag = args[i+1]
-			} else {
+			case "--server":
 				serverFlag = args[i+1]
+			default:
+				a.capabilities = args[i+1]
 			}
 			i++
+		case strings.HasPrefix(arg, "--capabilities="):
+			a.capabilities = strings.TrimPrefix(arg, "--capabilities=")
 		case strings.HasPrefix(arg, "--env="):
 			envFlag = strings.TrimPrefix(arg, "--env=")
 		case strings.HasPrefix(arg, "--server="):
@@ -130,7 +136,7 @@ const usage = `rabbit: bunny.net through Nordray White Rabbit, without the real 
 
 Usage:
   rabbit [--env NAME | --server URL] <command>
-  rabbit [--env NAME | --server URL] -- <bunny arguments...>
+  rabbit [--env NAME | --server URL] [--capabilities a,b] -- <bunny arguments...>
 
 White Rabbit commands:
   auth login [--no-browser]                        Sign in with the browser (email code + PKCE)
@@ -151,7 +157,7 @@ Everything after the first standalone -- is passed unchanged to BunnyCLI (bunny)
 In GitHub Actions (permissions: id-token: write) and Forgejo Actions (enable-openid-connect: true) rabbit uses the
 job's own OIDC token automatically. Environment: RABBIT_SERVER or RABBIT_ENV select the server, RABBIT_AUTH=ci or
 interactive overrides detection, RABBIT_BUNNY points at BunnyCLI, RABBIT_DEBUG=1 logs forwarded requests,
-RABBIT_CAPABILITIES=a,b limits what the forwarded bunny command may do.
+RABBIT_CAPABILITIES=a,b (or --capabilities a,b) limits what the forwarded bunny command may do.
 `
 
 func (a *App) command(ctx context.Context, envFlag, serverFlag, name string, args []string) (int, error) {
@@ -700,9 +706,14 @@ func (a *App) passthrough(ctx context.Context, envFlag, serverFlag string, args 
 		if err != nil {
 			return "", time.Time{}, err
 		}
-		// RABBIT_CAPABILITIES narrows the virtual credential, e.g. for an AI agent; the session itself has all.
+		// --capabilities or RABBIT_CAPABILITIES narrows the virtual credential, e.g. for an AI agent; the session
+		// itself has all.
+		list := a.capabilities
+		if list == "" {
+			list = a.Getenv("RABBIT_CAPABILITIES")
+		}
 		var capabilities []string
-		for _, c := range strings.Split(a.Getenv("RABBIT_CAPABILITIES"), ",") {
+		for _, c := range strings.Split(list, ",") {
 			if c = strings.TrimSpace(c); c != "" {
 				capabilities = append(capabilities, c)
 			}

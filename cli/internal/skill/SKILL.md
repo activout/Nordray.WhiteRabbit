@@ -7,7 +7,7 @@ description: Run bunny.net's BunnyCLI through a Nordray White Rabbit server with
 
 `rabbit -- <bunny arguments>` runs the official BunnyCLI (`bunny`) through a White Rabbit server. Neither the agent
 nor a CI job ever holds the real bunny.net API key. White Rabbit allows only the operations in its registry, and only
-with the capabilities of the credential (`RABBIT_CAPABILITIES`) or CI binding. Details: `cli/README.md` in github.com/activout/Nordray.WhiteRabbit.
+with the capabilities of the credential (`--capabilities`) or CI binding. Details: `cli/README.md` in github.com/activout/Nordray.WhiteRabbit.
 This file comes with rabbit: `rabbit skill install` updates it to match the installed version.
 
 ## Rules for the agent
@@ -16,7 +16,7 @@ This file comes with rabbit: `rabbit skill install` updates it to match the inst
   the bunny.net API key, and never use `--api-key` (rabbit refuses it).
 - **Sign-in is the user's.** `rabbit auth login` opens a browser for an emailed one-time code. Suggest the exact
   command with the `!` prefix so the user runs it. The session may use every capability, so run BunnyCLI with
-  `RABBIT_CAPABILITIES` set to the fewest the task needs.
+  `--capabilities` (or `RABBIT_CAPABILITIES`) set to the fewest the task needs.
 - **The bunny.net API key is the user's too.** Only the user runs `rabbit admin key set`; it reads the key from a
   hidden prompt or stdin. Never put the key in a command, file or message.
 - **Bindings change who can act on the user's Bunny account.** Show the full `rabbit admin bindings add` or `rm`
@@ -33,7 +33,7 @@ rabbit env use test
 ! rabbit auth login                                    # the user runs this: browser + emailed code, session for 8 h
 ! rabbit admin key set                                 # the user runs this once: stores their bunny.net API key
 rabbit auth whoami                                     # who, which server, whether a key is stored, until when
-RABBIT_CAPABILITIES=mc.read rabbit -- apps list        # everything after -- goes to BunnyCLI unchanged
+rabbit --capabilities mc.read -- apps list             # everything after -- goes to BunnyCLI unchanged
 rabbit auth logout
 ```
 
@@ -70,7 +70,7 @@ Not possible through rabbit:
 | Symptom | Meaning |
 |---|---|
 | `✖ Not found.` / 404 | The operation is not in White Rabbit's registry. Run with `RABBIT_DEBUG=1` to see the path, then report it; don't work around it with the real key |
-| 403 `capability_not_granted` (`required: X`) | Add `X` to `RABBIT_CAPABILITIES`, or to the CI binding |
+| 403 `capability_not_granted` (`required: X`) | Add `X` to `--capabilities`, or to the CI binding |
 | No session / expired | `! rabbit auth login` again |
 | 403 `bunny_api_key_not_configured` | The user stores their key: `! rabbit admin key set` |
 | CI: 401 `no_matching_binding` | No binding matches the job's repository, ref, workflow or event |

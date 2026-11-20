@@ -160,7 +160,7 @@ White Rabbit uses capability-based authorisation. There is no resource-level sco
 
 **RequiresAuthenticationOnly:** Some endpoints require only a valid virtual credential, not a specific capability. They still pass through White Rabbit and still return 401 without a credential.
 
-**Who has which capabilities:** a human session has every capability (it is the owner's own key); a workload session has exactly its binding's; a virtual credential has the subset it was issued for (`RABBIT_CAPABILITIES` in the CLI).
+**Who has which capabilities:** a human session has every capability (it is the owner's own key); a workload session has exactly its binding's; a virtual credential has the subset it was issued for (`--capabilities` or `RABBIT_CAPABILITIES` in the CLI).
 
 Per-request decision flow:
 1. Authenticate request (virtual credential in `AccessKey`; nothing else is accepted)
