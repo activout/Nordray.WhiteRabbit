@@ -8,7 +8,7 @@ namespace Nordray.WhiteRabbit.Proxy;
 /// <summary>
 /// Replaces YARP's default IForwarderHttpClientFactory to pin outbound connections
 /// to the bunny cluster against ISRG Root X1 (Let's Encrypt's root CA).
-/// All other clusters (e.g. dex) get a standard handler.
+/// Any other cluster would get a standard handler.
 /// </summary>
 public sealed class BunnyHttpClientFactory : IForwarderHttpClientFactory
 {

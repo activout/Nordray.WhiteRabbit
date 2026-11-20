@@ -15,6 +15,9 @@ public static class OpaqueToken
     /// <summary>Virtual Bunny credential, sent as <c>AccessKey</c> to White Rabbit's proxy only.</summary>
     public const string VirtualKeyPrefix = "wrk_";
 
+    /// <summary>One-time CLI login code, handed to the CLI's loopback listener by <c>/cli/login</c>.</summary>
+    public const string LoginCodePrefix = "wrc_";
+
     /// <summary>The prefix followed by 256 random bits, base64url without padding.</summary>
     public static string Generate(string prefix)
     {

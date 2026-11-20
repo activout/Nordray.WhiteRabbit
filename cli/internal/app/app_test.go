@@ -3,11 +3,14 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -59,12 +62,18 @@ func fakeBunny(args []string) int {
 }
 
 // fakeWhiteRabbit implements the CLI API and the proxy, plus a CI token endpoint.
+// storedKey is what the fake server last received at /api/admin/bunny-key ("PUT key" or "DELETE ").
+var storedKey string
+
+// requestedCapabilities is what the last /api/cli/credentials request asked for.
+var requestedCapabilities string
+
 func fakeWhiteRabbit(t *testing.T) *httptest.Server {
 	t.Helper()
 	sessions := map[string]string{"wrs_human": "human", "wrs_ci": "github_workload"}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/cli/config", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"dex_client_id":"rabbit-cli","federation_audience":"whiterabbit:test","capabilities":[{"name":"statistics.read"}]}`)
+		_, _ = io.WriteString(w, `{"federation_audience":"whiterabbit:test","capabilities":[{"name":"statistics.read"}]}`)
 	})
 	mux.HandleFunc("/idtoken", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "bearer job-request-token" || r.URL.Query().Get("audience") != "whiterabbit:test" {
@@ -73,9 +82,36 @@ func fakeWhiteRabbit(t *testing.T) *httptest.Server {
 		}
 		_, _ = io.WriteString(w, `{"value":"ci-id-token"}`)
 	})
+	var challenge string
+	mux.HandleFunc("/cli/login", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		challenge = q.Get("code_challenge")
+		http.Redirect(w, r, "http://127.0.0.1:"+q.Get("port")+"/callback?code=wrc_x&state="+url.QueryEscape(q.Get("state")), http.StatusFound)
+	})
+	mux.HandleFunc("/api/admin/bunny-key", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if sessions[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")] != "human" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		storedKey = r.Method + " " + body["api_key"]
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("/api/cli/exchange", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["code"] != "" {
+			sum := sha256.Sum256([]byte(body["code_verifier"]))
+			if body["code"] != "wrc_x" || base64.RawURLEncoding.EncodeToString(sum[:]) != challenge {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = io.WriteString(w, `{"error":"access_denied","reason":"code_verifier_mismatch"}`)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "wrs_human", "expires_at": time.Now().Add(time.Hour),
+				"principal": map[string]any{"type": "human", "email": "me@example.com"}})
+			return
+		}
 		if body["subject_token"] != "ci-id-token" {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = io.WriteString(w, `{"error":"access_denied","reason":"no_matching_binding"}`)
@@ -84,12 +120,17 @@ func fakeWhiteRabbit(t *testing.T) *httptest.Server {
 		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "wrs_ci", "expires_at": time.Now().Add(time.Hour),
 			"principal": map[string]any{"type": "github_workload", "repository": "acme/app"}})
 	})
-	authed := func(r *http.Request) string { return sessions[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")] }
+	authed := func(r *http.Request) string {
+		return sessions[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")]
+	}
 	mux.HandleFunc("/api/cli/credentials", func(w http.ResponseWriter, r *http.Request) {
 		if authed(r) == "" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		var body map[string][]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		requestedCapabilities = strings.Join(body["capabilities"], ",")
 		_ = json.NewEncoder(w).Encode(map[string]any{"access_key": "wrk_test", "credential_id": "c1", "expires_at": time.Now().Add(5 * time.Minute)})
 	})
 	mux.HandleFunc("/api/cli/whoami", func(w http.ResponseWriter, r *http.Request) {
@@ -294,13 +335,43 @@ func TestUsage(t *testing.T) {
 	}
 }
 
-func TestLoginRejectsUnknownCapabilityBeforeOpeningTheBrowser(t *testing.T) {
+func TestLogin_BrowserCodeIsExchangedAndTheSessionSaved(t *testing.T) {
 	h := newHarness(t)
-	opened := false
-	h.app.OpenBrowser = func(string) error { opened = true; return nil }
-	code := h.run("auth", "login", "--capabilities", "statistics.read,statistics.reed")
-	if code != 2 || opened || !strings.Contains(h.stderr.String(), `unknown capability "statistics.reed"`) {
-		t.Fatalf("exit %d, browser opened %v: %s", code, opened, h.stderr)
+	h.app.OpenBrowser = func(u string) error {
+		go func() {
+			if resp, err := http.Get(u); err == nil { // follows /cli/login's redirect to the loopback listener
+				resp.Body.Close()
+			}
+		}()
+		return nil
+	}
+	if code := h.run("auth", "login"); code != 0 || !strings.Contains(h.stdout.String(), "Signed in") {
+		t.Fatalf("exit %d: %s %s", code, h.stdout, h.stderr)
+	}
+	if !strings.Contains(h.stdout.String(), "rabbit admin key set") {
+		t.Fatalf("missing key hint: %s", h.stdout)
+	}
+	if s, err := h.app.Secrets.Get(h.server.URL); err != nil || s.Token != "wrs_human" {
+		t.Fatalf("session not saved: %v %+v", err, s)
+	}
+}
+
+func TestAdminKey_ReadsTheKeyFromStdinNotArgv(t *testing.T) {
+	h := newHarness(t)
+	_ = h.app.Secrets.Set(h.server.URL, secrets.Session{Token: "wrs_human", ExpiresAt: time.Now().Add(time.Hour)})
+	h.app.Stdin = strings.NewReader("  bunny-key-123  \nignored\n")
+	if code := h.run("admin", "key", "set"); code != 0 || storedKey != "PUT bunny-key-123" {
+		t.Fatalf("exit %d, stored %q: %s", code, storedKey, h.stderr)
+	}
+	if code := h.run("admin", "key", "set", "bunny-key-123"); code != 2 {
+		t.Fatal("a key on the command line must be refused")
+	}
+	h.app.Stdin = strings.NewReader("")
+	if code := h.run("admin", "key", "set"); code != 2 {
+		t.Fatal("an empty key must be refused")
+	}
+	if code := h.run("admin", "key", "rm"); code != 0 || storedKey != "DELETE " {
+		t.Fatalf("exit %d, stored %q", code, storedKey)
 	}
 }
 
@@ -369,5 +440,21 @@ func TestHomeDir_PrefersTheProfileOnWindows(t *testing.T) {
 	delete(env, "USERPROFILE")
 	if got := homeDir("windows", get); got != "/c/Users/me/msys-home" {
 		t.Fatalf("windows without USERPROFILE falls back to HOME: %q", got)
+	}
+}
+
+func TestPassthrough_RabbitCapabilitiesNarrowsTheCredential(t *testing.T) {
+	h := newHarness(t)
+	_ = h.app.Secrets.Set(h.server.URL, secrets.Session{Token: "wrs_human", ExpiresAt: time.Now().Add(time.Hour)})
+	h.vars["RABBIT_CAPABILITIES"] = " mc.read, db.read ,"
+	if code := h.run("--", "call", "/statistics"); code != 0 || requestedCapabilities != "mc.read,db.read" {
+		t.Fatalf("exit %d, requested %q: %s", code, requestedCapabilities, h.stderr)
+	}
+	// The flag wins over the variable.
+	if code := h.run("--capabilities", "statistics.read", "--", "call", "/statistics"); code != 0 || requestedCapabilities != "statistics.read" {
+		t.Fatalf("exit %d, requested %q: %s", code, requestedCapabilities, h.stderr)
+	}
+	if code := h.run("--capabilities=dns.read,dns.write", "--", "call", "/statistics"); code != 0 || requestedCapabilities != "dns.read,dns.write" {
+		t.Fatalf("exit %d, requested %q: %s", code, requestedCapabilities, h.stderr)
 	}
 }

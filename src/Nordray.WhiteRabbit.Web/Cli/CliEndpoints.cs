@@ -1,21 +1,24 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Options;
 using Nordray.WhiteRabbit.Bunny;
 using Nordray.WhiteRabbit.Core.Access;
 using Nordray.WhiteRabbit.Core.Federation;
 using Nordray.WhiteRabbit.Core.Models;
 using Nordray.WhiteRabbit.Infrastructure.Database;
+using Nordray.WhiteRabbit.Web.Proxy;
 
 namespace Nordray.WhiteRabbit.Web.Cli;
 
 /// <summary>
 /// The rabbit CLI's API:
 /// <list type="bullet">
-/// <item><c>POST /api/cli/exchange</c>: a Dex, GitHub or Forgejo identity token for a White Rabbit session.</item>
+/// <item><c>POST /api/cli/exchange</c>: a <c>/cli/login</c> code (human) or a GitHub/Forgejo identity token (CI) for a White Rabbit session.</item>
 /// <item><c>POST /api/cli/credentials</c>: a session for a short-lived virtual Bunny credential.</item>
 /// <item><c>GET /api/cli/whoami</c>, <c>POST /api/cli/revoke</c>.</item>
-/// <item><c>/api/admin/bindings</c>: an interactive human session manages its own workload bindings.</item>
+/// <item><c>/api/admin/bindings</c>, <c>/api/admin/bunny-key</c>: an interactive human session manages its own workload
+/// bindings and Bunny API key.</item>
 /// </list>
 /// </summary>
 public static class CliEndpoints
@@ -44,19 +47,21 @@ public static class CliEndpoints
         admin.MapGet("/", ListBindings);
         admin.MapPost("/", CreateBinding);
         admin.MapDelete("/{id:long}", RevokeBinding);
+
+        var key = app.MapGroup("/api/admin/bunny-key").RequireAuthorization(HumanPolicy).RequireRateLimiting(ApiRateLimit);
+        key.MapPut("/", SetBunnyKey);
+        key.MapDelete("/", RemoveBunnyKey);
     }
 
     // ---------------------------------------------------------------- discovery
 
     /// <summary>
-    /// What the rabbit CLI needs to know about this instance, so it only has to be told the server URL: the public
-    /// Dex client to sign in with, the audience CI tokens must be requested for (empty when CI federation is off),
-    /// and the capabilities it can ask for at sign-in. Nothing here is secret.
+    /// What the rabbit CLI needs to know about this instance, so it only has to be told the server URL: the audience
+    /// CI tokens must be requested for (empty when CI federation is off) and the capabilities. Nothing here is secret.
     /// </summary>
-    private static IResult Config(IOptions<CliOptions> cli, IOptions<FederationOptions> federation, BunnyOperationRegistry registry) =>
+    private static IResult Config(IOptions<FederationOptions> federation, BunnyOperationRegistry registry) =>
         Results.Json(new
         {
-            DexClientId = cli.Value.DexClientId,
             FederationAudience = federation.Value.Issuers.Count > 0 ? federation.Value.Audience : "",
             Capabilities = registry.GetCapabilities()
                 .OrderBy(c => c.Name, StringComparer.Ordinal)
@@ -65,51 +70,65 @@ public static class CliEndpoints
 
     // ---------------------------------------------------------------- exchange
 
-    public sealed record ExchangeRequest(string? SubjectToken);
+    /// <summary>Either <c>code</c> + <c>code_verifier</c> from <c>/cli/login</c>, or a CI <c>subject_token</c>.</summary>
+    public sealed record ExchangeRequest(string? SubjectToken, string? Code, string? CodeVerifier);
+
+    /// <summary>The issuer recorded on human sessions: White Rabbit's own sign-in.</summary>
+    public const string HumanIssuer = "white-rabbit";
+    public const string CliClientId = "rabbit-cli";
 
     private static async Task<IResult> Exchange(
         HttpContext ctx,
         IdentityTokenValidator validator,
         IUserRepository users,
         IWorkloadBindingDao bindings,
+        ICliLoginCodeDao loginCodes,
         ICliSessionDao sessions,
         CliPrincipalResolver resolver,
-        SignInPolicy signInPolicy,
         IOptions<CliOptions> cliOptions,
         SecurityAudit audit)
     {
         var (request, invalid) = await ReadJsonAsync<ExchangeRequest>(ctx);
         if (invalid is not null) return invalid;
-        if (string.IsNullOrWhiteSpace(request?.SubjectToken))
-            return Error(StatusCodes.Status400BadRequest, "invalid_request", "subject_token is required");
-
-        var validation = await validator.ValidateAsync(request.SubjectToken.Trim(), ctx.RequestAborted);
-        if (validation.Token is null)
-            return await DenyExchange(audit, validation.DenialReason!, validation.UnverifiedIssuer, null);
+        var hasCode = !string.IsNullOrWhiteSpace(request?.Code);
+        if (hasCode == !string.IsNullOrWhiteSpace(request?.SubjectToken))
+            return Error(StatusCodes.Status400BadRequest, "invalid_request", "send either code and code_verifier, or subject_token");
 
         var now = DateTime.UtcNow;
         var options = cliOptions.Value;
         CliSession session;
 
-        if (validation.Token.Workload is null)
+        if (hasCode)
         {
-            // A human: the Dex ID token the rabbit CLI received through the browser login.
-            var email = validation.Token.Token.TryGetPayloadValue<string>("email", out var e) ? e : null;
-            var user = email is null ? null : await users.FindByEmailAsync(email);
-            if (user is null || !signInPolicy.IsAllowed(email))
-                return await DenyExchange(audit, "user_not_allowed", validation.Token.IssuerUrl, null);
+            // A human: the one-time code /cli/login sent to the CLI's loopback listener. It is consumed before the
+            // verifier is checked, so a wrong guess burns it.
+            var code = request!.Code!.Trim();
+            var login = OpaqueToken.LooksLike(code, OpaqueToken.LoginCodePrefix)
+                ? await loginCodes.ConsumeAsync(OpaqueToken.Hash(code), now)
+                : null;
+            if (login is null)
+                return await DenyExchange(audit, "invalid_login_code", HumanIssuer, null);
+            if (!Pkce.Matches(request.CodeVerifier, login.CodeChallenge))
+                return await DenyExchange(audit, "code_verifier_mismatch", HumanIssuer, null);
+            var user = await users.FindByIdAsync(login.UserId);
+            if (user is null)
+                return await DenyExchange(audit, "owner_missing", HumanIssuer, null);
 
             session = NewSession(now, options.HumanSessionLifetime) with
             {
                 PrincipalType = PrincipalTypes.Human,
                 UserId = user.Id,
                 Subject = user.Subject,
-                Issuer = validation.Token.IssuerUrl,
-                ClientId = options.DexClientId,
+                Issuer = HumanIssuer,
+                ClientId = CliClientId,
             };
         }
         else
         {
+            var validation = await validator.ValidateAsync(request!.SubjectToken!.Trim(), ctx.RequestAborted);
+            if (validation.Token is null)
+                return await DenyExchange(audit, validation.DenialReason!, validation.UnverifiedIssuer, null);
+
             var identity = IdentityTokenValidator.ToWorkloadIdentity(validation.Token);
             var match = BindingRules.Match(identity, await bindings.ListActiveByIssuerAsync(identity.IssuerName));
             if (match.Binding is null)
@@ -368,6 +387,37 @@ public static class CliEndpoints
         return Results.NoContent();
     }
 
+    // ---------------------------------------------------------------- admin: Bunny API key
+
+    public sealed record BunnyKeyRequest(string? ApiKey);
+
+    /// <summary>Stores the owner's bunny.net API key, protected with the database key ring. Never echoed or audited.</summary>
+    private static async Task<IResult> SetBunnyKey(
+        HttpContext ctx, IUserRepository users, IDataProtectionProvider dataProtection, CliPrincipalResolver resolver, SecurityAudit audit)
+    {
+        var (principal, denied) = await ResolveAsync(ctx, resolver, audit, "admin.bunny_key.set", DateTime.UtcNow);
+        if (principal is null) return denied!;
+        var (request, invalid) = await ReadJsonAsync<BunnyKeyRequest>(ctx);
+        if (invalid is not null) return invalid;
+        var apiKey = request?.ApiKey?.Trim();
+        if (string.IsNullOrEmpty(apiKey) || apiKey.Length > 256 || apiKey.Any(char.IsWhiteSpace))
+            return Error(StatusCodes.Status400BadRequest, "invalid_request", "api_key must be a bunny.net API key");
+
+        await users.UpdateBunnyApiKeyAsync(principal.Owner.Id, dataProtection.CreateProtector(BunnyProxyGate.KeyPurpose).Protect(apiKey));
+        await audit.RecordAsync(principal.Describe("admin.bunny_key.set", SecurityEvent.Allowed) with { HttpStatus = 204 });
+        return Results.NoContent();
+    }
+
+    private static async Task<IResult> RemoveBunnyKey(
+        HttpContext ctx, IUserRepository users, CliPrincipalResolver resolver, SecurityAudit audit)
+    {
+        var (principal, denied) = await ResolveAsync(ctx, resolver, audit, "admin.bunny_key.remove", DateTime.UtcNow);
+        if (principal is null) return denied!;
+        await users.UpdateBunnyApiKeyAsync(principal.Owner.Id, null);
+        await audit.RecordAsync(principal.Describe("admin.bunny_key.remove", SecurityEvent.Allowed) with { HttpStatus = 204 });
+        return Results.NoContent();
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private static async Task<(CliPrincipal? Principal, IResult? Denied)> ResolveAsync(
@@ -408,6 +458,7 @@ public static class CliEndpoints
         RunId = p.Session.RunId,
         Capabilities = p.Capabilities.Order(StringComparer.Ordinal),
         SessionExpiresAt = p.Session.ExpiresUtc,
+        HasBunnyKey = !string.IsNullOrEmpty(p.Owner.BunnyApiKey),
     };
 
     private static object DescribeBinding(WorkloadBinding b) => new

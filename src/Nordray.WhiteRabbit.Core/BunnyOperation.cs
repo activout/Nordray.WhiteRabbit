@@ -47,7 +47,7 @@ public enum BunnyCredentialKind
 }
 
 /// <summary>
-/// What a capability allows, as shown on the consent page, by the CLI and in the capability table. One description
-/// covers every operation of the capability, so approving it never grants more than the text says.
+/// What a capability allows, as shown by the CLI and in the capability table. One description covers every operation
+/// of the capability, so granting it to a binding never grants more than the text says.
 /// </summary>
 public sealed record CapabilityDescription(string Name, string Title, string Description);

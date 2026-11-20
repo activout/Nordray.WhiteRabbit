@@ -19,8 +19,11 @@ public class DatabaseMigratorTests
 
         Assert.Empty(await migrator.PendingVersionsAsync());
         Assert.Equal(DatabaseMigrator.Embedded.Count, await ScalarAsync(connection, "SELECT COUNT(*) FROM SchemaMigrations"));
-        foreach (var table in new[] { "Users", "LoginCodes", "OAuthClients", "Capabilities", "Grants", "GrantCapabilities", "DataProtectionKeys", "WorkloadBindings", "CliSessions", "VirtualCredentials", "SecurityEvents" })
+        foreach (var table in new[] { "Users", "LoginCodes", "DataProtectionKeys", "WorkloadBindings", "CliLoginCodes", "CliSessions", "VirtualCredentials", "SecurityEvents" })
             Assert.Equal(1, await ScalarAsync(connection, $"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '{table}'"));
+        // Dropped with Dex in 003.
+        foreach (var table in new[] { "OAuthClients", "Capabilities", "Grants", "GrantCapabilities" })
+            Assert.Equal(0, await ScalarAsync(connection, $"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '{table}'"));
     }
 
     [Fact]

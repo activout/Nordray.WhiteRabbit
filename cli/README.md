@@ -28,9 +28,10 @@ Tested with BunnyCLI 0.22.0.
 ## How it works
 
 1. **Authenticate.**
-   - Interactively, `rabbit auth login` signs in through White Rabbit's Dex as the public client `rabbit-cli`, using the authorization code flow with PKCE (S256), the system browser and a loopback redirect on `127.0.0.1`. No client secret is shipped in the binary.
+   - Interactively, `rabbit auth login` opens White Rabbit's `/cli/login` in the system browser. After the emailed one-time code and a confirmation, White Rabbit redirects to a loopback listener on `127.0.0.1` with a one-time code bound to rabbit's PKCE (S256) challenge, so only this rabbit process can redeem it. No secret is shipped in the binary.
+   - Once, store your bunny.net API key with `rabbit admin key set` (hidden prompt, or `rabbit admin key set < key.txt`). It is never taken from the command line.
    - In GitHub Actions or Forgejo Actions, rabbit requests the job's own OIDC token instead.
-2. **Exchange.** The identity token is exchanged at `/api/cli/exchange` for a White Rabbit session.
+2. **Exchange.** The login code (with its verifier) or the CI identity token is exchanged at `/api/cli/exchange` for a White Rabbit session. An interactive session may use every capability; limit what a `rabbit -- …` command may do with `rabbit --capabilities a,b -- …` or `RABBIT_CAPABILITIES=a,b`.
    - Interactive sessions are stored only in the OS credential store (macOS Keychain, Windows Credential Manager, Secret Service on Linux). Without one, nothing is saved and the next command asks you to sign in again.
    - There are no refresh tokens: sign in again when the session expires (8 hours).
 3. **`rabbit -- …`**

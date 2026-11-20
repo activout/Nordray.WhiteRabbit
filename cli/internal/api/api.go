@@ -60,7 +60,6 @@ func IsStatus(err error, status int) bool {
 
 // Config is GET /api/cli/config.
 type Config struct {
-	DexClientId        string       `json:"dex_client_id"`
 	FederationAudience string       `json:"federation_audience"`
 	Capabilities       []Capability `json:"capabilities"`
 }
@@ -86,6 +85,7 @@ type Principal struct {
 	WorkflowRef      string    `json:"workflow_ref,omitempty"`
 	RunId            string    `json:"run_id,omitempty"`
 	Capabilities     []string  `json:"capabilities"`
+	HasBunnyKey      bool      `json:"has_bunny_key"`
 	SessionExpiresAt time.Time `json:"session_expires_at"`
 }
 
@@ -124,6 +124,13 @@ type Binding struct {
 func (c *Client) Config(ctx context.Context) (*Config, error) {
 	var out Config
 	return &out, c.do(ctx, http.MethodGet, "/api/cli/config", "", nil, &out)
+}
+
+// ExchangeCode redeems a /cli/login code with its PKCE verifier.
+func (c *Client) ExchangeCode(ctx context.Context, code, verifier string) (*Session, error) {
+	var out Session
+	err := c.do(ctx, http.MethodPost, "/api/cli/exchange", "", map[string]string{"code": code, "code_verifier": verifier}, &out)
+	return &out, err
 }
 
 func (c *Client) Exchange(ctx context.Context, subjectToken string) (*Session, error) {
@@ -169,16 +176,13 @@ func (c *Client) DeleteBinding(ctx context.Context, session string, id int64) er
 	return c.do(ctx, http.MethodDelete, fmt.Sprintf("/api/admin/bindings/%d", id), session, nil, nil)
 }
 
-// DiscoveryDocument is the OIDC discovery document White Rabbit serves for its Dex.
-type DiscoveryDocument struct {
-	Issuer                string `json:"issuer"`
-	AuthorizationEndpoint string `json:"authorization_endpoint"`
-	TokenEndpoint         string `json:"token_endpoint"`
+// SetBunnyKey stores the owner's bunny.net API key. The key is sent once and never returned.
+func (c *Client) SetBunnyKey(ctx context.Context, session, apiKey string) error {
+	return c.do(ctx, http.MethodPut, "/api/admin/bunny-key", session, map[string]string{"api_key": apiKey}, nil)
 }
 
-func (c *Client) Discovery(ctx context.Context) (*DiscoveryDocument, error) {
-	var out DiscoveryDocument
-	return &out, c.do(ctx, http.MethodGet, "/.well-known/openid-configuration", "", nil, &out)
+func (c *Client) RemoveBunnyKey(ctx context.Context, session string) error {
+	return c.do(ctx, http.MethodDelete, "/api/admin/bunny-key", session, nil, nil)
 }
 
 // ProblemsError carries a rejected binding's problems.

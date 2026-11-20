@@ -2,12 +2,10 @@ using System.Data.Common;
 using System.Security.Claims;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.DataProtection.KeyManagement;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
-using Nordray.WhiteRabbit.AuthProxy;
 using Nordray.WhiteRabbit.Bunny;
 using Nordray.WhiteRabbit.Core.Access;
 using Nordray.WhiteRabbit.Core.Services;
@@ -34,15 +32,12 @@ builder.Configuration.AddEnvironmentVariables(prefix: "WhiteRabbit_");
 
 var configuration = builder.Configuration;
 
-// --- Infrastructure (DB, email, login codes, grants, audit) ---
+// --- Infrastructure (DB, email, login codes, audit) ---
 builder.Services.AddInfrastructure(configuration);
 
 // Create the registry before DI is built so we can use it to generate YARP routes.
 var bunnyRegistry = new BunnyOperationRegistry();
 builder.Services.AddSingleton(bunnyRegistry);
-
-// --- Capability seeder (scoped — uses the request-scoped connection) ---
-builder.Services.AddScoped<CapabilitySeeder>();
 
 // --- Data Protection ---
 // The key ring protects the stored Bunny API keys, so it lives in the database (encrypted with
@@ -55,13 +50,6 @@ builder.Services.AddOptions<KeyManagementOptions>().Configure<IServiceProvider>(
     keys.XmlRepository = new DatabaseKeyRing(services);
     keys.XmlEncryptor = new KeyRingEncryptor(services.GetRequiredService<KeyRingEncryption>());
 });
-
-// --- Proxy clients ---
-// OIDC client IDs whose Dex tokens the Bunny proxy accepts. Empty means none: tokens must name an
-// explicitly configured audience.
-var proxyClients = new ProxyClientOptions(
-    configuration.GetSection("Proxy:AllowedClientIds").Get<string[]>() ?? []);
-builder.Services.AddSingleton(proxyClients);
 
 // --- rabbit CLI: sessions, CI federation, virtual credentials ---
 builder.Services.Configure<CliOptions>(configuration.GetSection("Cli"));
@@ -76,25 +64,23 @@ builder.Services.AddSingleton<ProxyRequestBodyPolicy>();
 builder.Services.AddHttpContextAccessor();
 
 // --- Authentication ---
-// Cookie for the White Rabbit UI; JWT Bearer for Dex tokens of OIDC clients calling the proxy; CliSession for
-// White Rabbit session tokens (wrs_…) on the CLI and admin API. A policy scheme picks one per request.
+// Cookie for the email-code sign-in pages and /cli/login; CliSession for White Rabbit session tokens (wrs_…) on the
+// CLI and admin API. A policy scheme picks one per request.
 // Virtual credentials (AccessKey: wrk_…) are not an authentication scheme: only BunnyProxyGate accepts them.
 builder.Services.AddAuthentication(options =>
 {
     options.DefaultScheme = "SmartScheme";
     options.DefaultChallengeScheme = CookieAuthenticationDefaults.AuthenticationScheme;
 })
-.AddPolicyScheme("SmartScheme", "Cookie or Bearer", options =>
+.AddPolicyScheme("SmartScheme", "Cookie or CLI session", options =>
 {
-    // Each credential is accepted only where it belongs: White Rabbit sessions (wrs_…) on the CLI and admin API, Dex
-    // bearer tokens on Bunny proxy routes. Everywhere else (UI pages, consent, the Dex /auth flow) the
-    // allow-list-validated cookie is required, whatever Authorization header the request carries.
+    // White Rabbit sessions (wrs_…) are accepted only on the CLI and admin API. Everywhere else the
+    // allow-list-validated cookie is required, whatever Authorization header the request carries. The Bunny proxy
+    // authenticates virtual credentials itself (BunnyProxyGate).
     options.ForwardDefaultSelector = ctx =>
         (ctx.Request.Path.StartsWithSegments("/api/cli", StringComparison.OrdinalIgnoreCase)
          || ctx.Request.Path.StartsWithSegments("/api/admin", StringComparison.OrdinalIgnoreCase))
         && CliSessionAuthenticationHandler.Carries(ctx.Request) ? CliSessionAuthenticationHandler.SchemeName
-        : ctx.Request.Path.StartsWithSegments("/proxy", StringComparison.OrdinalIgnoreCase)
-        && ctx.Request.Headers.ContainsKey("Authorization") ? JwtBearerDefaults.AuthenticationScheme
         : CookieAuthenticationDefaults.AuthenticationScheme;
 })
 .AddCookie(CookieAuthenticationDefaults.AuthenticationScheme, options =>
@@ -116,28 +102,11 @@ builder.Services.AddAuthentication(options =>
         }
     };
 })
-.AddJwtBearer(JwtBearerDefaults.AuthenticationScheme, options =>
-{
-    // Dex is the token authority. White Rabbit proxies its well-known endpoints
-    // so the issuer URL is White Rabbit's own address in production.
-    options.Authority = configuration["Dex:IssuerUrl"];
-    options.RequireHttpsMetadata = !builder.Environment.IsDevelopment();
-    options.TokenValidationParameters = new()
-    {
-        // The token must be issued to one of the configured proxy clients. Issuer and signature come from
-        // the Authority's metadata; GitHub, Forgejo or other-environment tokens fail on issuer or signature.
-        ValidateAudience = true,
-        ValidateIssuer = true,
-        ValidateLifetime = true,
-        RequireExpirationTime = true,
-        AudienceValidator = (audiences, _, _) => audiences.Any(proxyClients.AllowedClientIds.Contains),
-    };
-})
 .AddScheme<AuthenticationSchemeOptions, CliSessionAuthenticationHandler>(CliSessionAuthenticationHandler.SchemeName, null);
 
 builder.Services.AddAuthorization(options =>
 {
-    // The CLI API accepts only White Rabbit session tokens: never cookies, Dex tokens or virtual credentials.
+    // The CLI API accepts only White Rabbit session tokens: never cookies or virtual credentials.
     options.AddPolicy(CliEndpoints.SessionPolicy, policy => policy
         .AddAuthenticationSchemes(CliSessionAuthenticationHandler.SchemeName)
         .RequireAuthenticatedUser());
@@ -186,18 +155,7 @@ builder.Services.AddRateLimiter(opts =>
 
 // --- YARP routes and clusters ---
 
-var dexAddress = configuration["Dex:InternalAddress"] ?? "http://dex:5556";
 string[] RemoteIdentityHeaders = ["X-Remote-User", "X-Remote-Groups", "X-Remote-Extra"];
-
-var dexRoutes = new List<RouteConfig>
-{
-    new() { RouteId = "dex-auth",      ClusterId = "dex", Match = new RouteMatch { Path = "/auth/{**catch}" } },
-    new() { RouteId = "dex-discovery", ClusterId = "dex", Match = new RouteMatch { Path = "/.well-known/openid-configuration" } },
-    new() { RouteId = "dex-token",     ClusterId = "dex", Match = new RouteMatch { Path = "/token" } },
-    new() { RouteId = "dex-keys",      ClusterId = "dex", Match = new RouteMatch { Path = "/keys" } },
-    new() { RouteId = "dex-userinfo",  ClusterId = "dex", Match = new RouteMatch { Path = "/userinfo" } },
-    new() { RouteId = "dex-callback",  ClusterId = "dex", Match = new RouteMatch { Path = "/callback/{**catch}" } },
-};
 
 // One YARP route per registered bunny operation. Metadata carries the capability
 // and credential requirements so the proxy pipeline can enforce them without
@@ -222,15 +180,6 @@ var bunnyRoutes = bunnyRegistry.GetAll().Select(op => new RouteConfig
     },
 }).ToList();
 
-var dexCluster = new ClusterConfig
-{
-    ClusterId = "dex",
-    Destinations = new Dictionary<string, DestinationConfig>
-    {
-        ["primary"] = new() { Address = dexAddress },
-    },
-};
-
 var bunnyCluster = new ClusterConfig
 {
     ClusterId = "bunny",
@@ -241,28 +190,9 @@ var bunnyCluster = new ClusterConfig
 };
 
 builder.Services.AddReverseProxy()
-    .LoadFromMemory([.. dexRoutes, .. bunnyRoutes], [dexCluster, bunnyCluster])
+    .LoadFromMemory(bunnyRoutes, [bunnyCluster])
     .AddTransforms(ctx =>
     {
-        // Dex: Dex trusts X-Remote-User as the signed-in identity, so a client-supplied value never reaches it on any
-        // route. On /auth/* and /callback/* (where the authproxy connector reads it) only the verified email is set.
-        if (ctx.Route.ClusterId == "dex")
-        {
-            var injectUser = ctx.Route.RouteId is "dex-auth" or "dex-callback";
-            ctx.AddRequestTransform(transform =>
-            {
-                foreach (var header in RemoteIdentityHeaders)
-                    transform.ProxyRequest.Headers.Remove(header);
-                var email = injectUser
-                    ? DexAuthProxyMiddleware.GetRemoteUser(transform.HttpContext)
-                      ?? transform.HttpContext.User.FindFirstValue(ClaimTypes.Email)
-                    : null;
-                if (email is not null)
-                    transform.ProxyRequest.Headers.TryAddWithoutValidation("X-Remote-User", email);
-                return ValueTask.CompletedTask;
-            });
-        }
-
         // Bunny: strip /proxy/api.bunny.net prefix, remove inbound credential and
         // identity headers, set Host, and inject the user's AccessKey that the
         // pipeline middleware stored in Items.
@@ -332,19 +262,13 @@ app.Services.GetRequiredService<KeyRingEncryption>();
 var signInPolicy = app.Services.GetRequiredService<SignInPolicy>();
 if (!signInPolicy.AllowsAnyone)
     app.Logger.LogWarning("Access:AllowedEmails and Access:AllowedDomains are empty: nobody can sign in.");
-if (proxyClients.AllowedClientIds.Count == 0)
-    app.Logger.LogWarning("Proxy:AllowedClientIds is empty: the Bunny proxy accepts no bearer tokens.");
 
 
-// Ensure database schema exists and capabilities are seeded before serving requests
+// Ensure the database schema exists before serving requests
 await app.Services.GetRequiredService<DatabaseInitializer>().InitializeAsync();
 // Refuse to start with a key that cannot read the stored key ring, or with stored Bunny keys but no key ring:
 // either would make every stored Bunny API key unreadable while the service reported itself ready.
 await app.Services.GetRequiredService<KeyRingVerifier>().VerifyAsync();
-using (var scope = app.Services.CreateScope())
-{
-    await scope.ServiceProvider.GetRequiredService<CapabilitySeeder>().SeedAsync();
-}
 
 app.UseForwardedHeaders();
 app.UseCorrelationId();
@@ -352,12 +276,6 @@ app.UseStaticFiles();
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseRateLimiter();
-
-// DexAuthProxyMiddleware intercepts /auth/* (but not /auth/email/* which are White Rabbit endpoints)
-app.UseWhen(
-    ctx => ctx.Request.Path.StartsWithSegments("/auth", StringComparison.OrdinalIgnoreCase)
-        && !ctx.Request.Path.StartsWithSegments("/auth/email", StringComparison.OrdinalIgnoreCase),
-    branch => branch.UseMiddleware<DexAuthProxyMiddleware>());
 
 // --- Health endpoints ---
 // /health: the process is running. /ready: the database answers and every shipped migration is applied.
@@ -399,9 +317,8 @@ app.Map("/proxy/{**path}", async (HttpContext ctx, SecurityAudit audit) =>
 // --- Razor Pages ---
 app.MapRazorPages();
 
-// --- YARP (Dex + Bunny proxy) ---
-// BunnyProxyGate enforces authentication (virtual credential or Dex token), the sign-in allow-list, capability
-// grants and server-side credential injection for bunny routes before YARP forwards the request.
+// --- YARP (Bunny proxy) ---
+// BunnyProxyGate enforces authentication (virtual credential), the sign-in allow-list, capabilities and server-side credential injection for bunny routes before YARP forwards the request.
 var bunnyGate = app.Services.GetRequiredService<BunnyProxyGate>();
 var bodyPolicy = app.Services.GetRequiredService<ProxyRequestBodyPolicy>();
 app.MapReverseProxy(proxyPipeline =>

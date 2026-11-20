@@ -7,15 +7,18 @@ description: Run bunny.net's BunnyCLI through a Nordray White Rabbit server with
 
 `rabbit -- <bunny arguments>` runs the official BunnyCLI (`bunny`) through a White Rabbit server. Neither the agent
 nor a CI job ever holds the real bunny.net API key. White Rabbit allows only the operations in its registry, and only
-with the capabilities the session was granted. Details: `cli/README.md` in github.com/activout/Nordray.WhiteRabbit.
+with the capabilities of the credential (`--capabilities`) or CI binding. Details: `cli/README.md` in github.com/activout/Nordray.WhiteRabbit.
 This file comes with rabbit: `rabbit skill install` updates it to match the installed version.
 
 ## Rules for the agent
 
 - **Use `rabbit -- …`, not `bunny …`**, whenever the user works through White Rabbit. Never ask for, read or pass
   the bunny.net API key, and never use `--api-key` (rabbit refuses it).
-- **Sign-in is the user's.** `rabbit auth login` opens a browser for a consent page. Suggest the exact command with
-  the `!` prefix so the user runs it, and request the fewest capabilities the task needs.
+- **Sign-in is the user's.** `rabbit auth login` opens a browser for an emailed one-time code. Suggest the exact
+  command with the `!` prefix so the user runs it. The session may use every capability, so run BunnyCLI with
+  `--capabilities` (or `RABBIT_CAPABILITIES`) set to the fewest the task needs.
+- **The bunny.net API key is the user's too.** Only the user runs `rabbit admin key set`; it reads the key from a
+  hidden prompt or stdin. Never put the key in a command, file or message.
 - **Bindings change who can act on the user's Bunny account.** Show the full `rabbit admin bindings add` or `rm`
   command and get the user's confirmation before running it. Admin commands work only in an interactive session.
 - **Never print a credential.** `RABBIT_DEBUG=1` logs only method, path and status. It is safe to use.
@@ -27,13 +30,14 @@ This file comes with rabbit: `rabbit skill install` updates it to match the inst
 ```sh
 rabbit env add test https://whiterabbit.example.com   # once per server; URLs only, never credentials
 rabbit env use test
-! rabbit auth login --capabilities mc.read,db.read     # the user runs this: browser + consent, session for 8 h
-rabbit auth whoami                                     # who, which server, which capabilities, until when
-rabbit -- apps list                                    # everything after -- goes to BunnyCLI unchanged
+! rabbit auth login                                    # the user runs this: browser + emailed code, session for 8 h
+! rabbit admin key set                                 # the user runs this once: stores their bunny.net API key
+rabbit auth whoami                                     # who, which server, whether a key is stored, until when
+rabbit --capabilities mc.read -- apps list             # everything after -- goes to BunnyCLI unchanged
 rabbit auth logout
 ```
 
-To get more capabilities, sign in again with the larger set. There are no refresh tokens.
+There are no refresh tokens: sign in again when the session expires.
 
 ## Capabilities
 
@@ -66,8 +70,9 @@ Not possible through rabbit:
 | Symptom | Meaning |
 |---|---|
 | `✖ Not found.` / 404 | The operation is not in White Rabbit's registry. Run with `RABBIT_DEBUG=1` to see the path, then report it; don't work around it with the real key |
-| 403 `capability_not_granted` (`required: X`) | Sign in again with `X` added, or add `X` to the CI binding |
-| No session / expired | `! rabbit auth login …` again |
+| 403 `capability_not_granted` (`required: X`) | Add `X` to `--capabilities`, or to the CI binding |
+| No session / expired | `! rabbit auth login` again |
+| 403 `bunny_api_key_not_configured` | The user stores their key: `! rabbit admin key set` |
 | CI: 401 `no_matching_binding` | No binding matches the job's repository, ref, workflow or event |
 | CI: 401 `event_not_allowed` | A `pull_request` job. These never get a credential, by design |
 

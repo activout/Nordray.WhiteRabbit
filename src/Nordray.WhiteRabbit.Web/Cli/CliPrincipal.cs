@@ -1,6 +1,6 @@
 using Nordray.WhiteRabbit.Core.Access;
 using Nordray.WhiteRabbit.Core.Models;
-using Nordray.WhiteRabbit.Core.Services;
+using Nordray.WhiteRabbit.Bunny;
 using Nordray.WhiteRabbit.Infrastructure.Database;
 
 namespace Nordray.WhiteRabbit.Web.Cli;
@@ -31,13 +31,13 @@ public sealed record CliPrincipal(CliSession Session, User Owner, WorkloadBindin
 }
 
 /// <summary>
-/// Rebuilds a session's principal on every use, so revoking a grant or a binding, or removing the owner from the
+/// Rebuilds a session's principal on every use, so revoking a binding, or removing the owner from the
 /// sign-in allow-list, takes effect immediately rather than when the session expires.
 /// </summary>
 public sealed class CliPrincipalResolver(
     IUserRepository users,
     IWorkloadBindingDao bindings,
-    IGrantService grants,
+    BunnyOperationRegistry registry,
     SignInPolicy signInPolicy)
 {
     public sealed record Result(CliPrincipal? Principal, string? DenialReason);
@@ -53,8 +53,9 @@ public sealed class CliPrincipalResolver(
 
         if (session.PrincipalType == PrincipalTypes.Human)
         {
-            var granted = await grants.GetGrantedCapabilitiesAsync(owner.Email, session.ClientId ?? "");
-            return new Result(new CliPrincipal(session, owner, null, granted), null);
+            // The owner's own key: every capability. Virtual credentials and bindings narrow it.
+            var all = registry.GetCapabilities().Select(c => c.Name).ToHashSet(StringComparer.Ordinal);
+            return new Result(new CliPrincipal(session, owner, null, all), null);
         }
 
         var binding = session.BindingId is { } id ? await bindings.FindAsync(id) : null;

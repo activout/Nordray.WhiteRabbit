@@ -1,12 +1,10 @@
 using System.Security.Claims;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.IdentityModel.JsonWebTokens;
-using Microsoft.IdentityModel.Protocols;
 using Microsoft.IdentityModel.Protocols.OpenIdConnect;
 using Microsoft.IdentityModel.Tokens;
 using Nordray.WhiteRabbit.Core.Services;
@@ -17,31 +15,25 @@ using Yarp.ReverseProxy.Forwarder;
 namespace Nordray.WhiteRabbit.Tests.Integration;
 
 /// <summary>
-/// The real application with a temporary libSQL database, a fixed signing key standing in for Dex,
-/// and an email sender that records codes instead of sending them.
+/// The real application with a temporary libSQL database, fake CI issuer metadata, and an email sender that records
+/// codes instead of sending them.
 /// </summary>
 public sealed class WhiteRabbitFactory(string connectionString, string encryptionKey) : WebApplicationFactory<Program>
 {
-    public const string Issuer = "https://whiterabbit.test.invalid";
     public const string AllowedEmail = "allowed@example.com";
     public const string AllowedDomain = "team.example.com";
-    public const string ProxyClient = "example-client";
-    public const string CliClient = "rabbit-cli";
     public const string FederationAudience = "whiterabbit:test";
     public const string GitHubIssuer = "https://token.actions.githubusercontent.com";
     public const string ForgejoIssuer = "https://codebahn.net/api/actions";
-
-    public static readonly SymmetricSecurityKey SigningKey = new(Convert.FromBase64String("q83vEjRWeJBYd0Q8t3z5uM8yQ2pJ0lV1n9cX6kHrT2E="));
 
     public RecordingEmailService Emails { get; } = new();
 
     /// <summary>Stands in for api.bunny.net: every forwarded request ends here, never on the network.</summary>
     public MockHttpMessageHandler Upstream { get; } = new();
 
-    /// <summary>RS256 keys of the Dex, GitHub and Forgejo issuers, published through fake discovery metadata.</summary>
+    /// <summary>RS256 keys of the GitHub and Forgejo issuers, published through fake discovery metadata.</summary>
     public static readonly IReadOnlyDictionary<string, RsaSecurityKey> IssuerKeys = new Dictionary<string, RsaSecurityKey>
     {
-        [Issuer] = NewRsaKey("dex-key"),
         [GitHubIssuer] = NewRsaKey("github-key"),
         [ForgejoIssuer] = NewRsaKey("forgejo-key"),
     };
@@ -61,10 +53,6 @@ public sealed class WhiteRabbitFactory(string connectionString, string encryptio
         builder.UseSetting("DataProtection:EncryptionKey", encryptionKey);
         builder.UseSetting("Access:AllowedEmails:0", AllowedEmail);
         builder.UseSetting("Access:AllowedDomains:0", AllowedDomain);
-        builder.UseSetting("Proxy:AllowedClientIds:0", ProxyClient);
-        builder.UseSetting("Dex:IssuerUrl", Issuer);
-        builder.UseSetting("Dex:InternalAddress", "http://127.0.0.1:9");
-        builder.UseSetting("Cli:DexClientId", CliClient);
         builder.UseSetting("Federation:Audience", FederationAudience);
         builder.UseSetting("Federation:Issuers:0:Name", "github");
         builder.UseSetting("Federation:Issuers:0:Kind", "GitHub");
@@ -83,47 +71,15 @@ public sealed class WhiteRabbitFactory(string connectionString, string encryptio
             services.AddSingleton<IOidcMetadataProvider>(new StaticMetadataProvider());
             services.RemoveAll<IForwarderHttpClientFactory>();
             services.AddSingleton<IForwarderHttpClientFactory>(new MockForwarderClientFactory(Upstream));
-            services.PostConfigure<JwtBearerOptions>(JwtBearerDefaults.AuthenticationScheme, options =>
-            {
-                var configuration = new OpenIdConnectConfiguration { Issuer = Issuer };
-                configuration.SigningKeys.Add(SigningKey);
-                options.Configuration = configuration;
-                options.ConfigurationManager = new StaticConfigurationManager<OpenIdConnectConfiguration>(configuration);
-                options.TokenValidationParameters.ValidIssuer = Issuer;
-                options.TokenValidationParameters.IssuerSigningKey = SigningKey;
-            });
         });
     }
 
     public HttpClient CreateHttpsClient() =>
         CreateClient(new WebApplicationFactoryClientOptions { BaseAddress = new Uri("https://localhost"), AllowAutoRedirect = false });
 
-    public static string Token(
-        string email = AllowedEmail,
-        string[]? audiences = null,
-        string? azp = null,
-        string issuer = Issuer,
-        DateTime? expires = null,
-        SecurityKey? key = null)
-    {
-        var claims = new Dictionary<string, object> { ["email"] = email, ["sub"] = "subject-1" };
-        var aud = audiences ?? [ProxyClient];
-        claims["aud"] = aud.Length == 1 ? aud[0] : aud;
-        if (azp is not null) claims["azp"] = azp;
-        var notBefore = (expires ?? DateTime.UtcNow.AddMinutes(10)).AddMinutes(-20);
-        return new JsonWebTokenHandler().CreateToken(new SecurityTokenDescriptor
-        {
-            Issuer = issuer,
-            Claims = claims,
-            NotBefore = notBefore,
-            IssuedAt = notBefore,
-            Expires = expires ?? DateTime.UtcNow.AddMinutes(10),
-            SigningCredentials = new SigningCredentials(key ?? SigningKey, SecurityAlgorithms.HmacSha256),
-        });
-    }
 }
 
-/// <summary>Signs CI and Dex ID tokens the way the real issuers do (RS256, kid in the header).</summary>
+/// <summary>Signs CI identity tokens the way the real issuers do (RS256, kid in the header).</summary>
 public static class IdentityTokens
 {
     public static string Create(
@@ -219,18 +175,21 @@ public sealed class MockForwarderClientFactory(MockHttpMessageHandler handler) :
 
 public sealed class RecordingEmailService : IEmailService
 {
-    private readonly List<string> _recipients = [];
+    private readonly List<(string To, string Code)> _sent = [];
 
     public IReadOnlyList<string> Recipients
     {
-        get { lock (_recipients) return _recipients.ToList(); }
+        get { lock (_sent) return _sent.Select(s => s.To).ToList(); }
     }
 
-    public string? LastCode { get; private set; }
+    public string LastCode(string toEmail)
+    {
+        lock (_sent) return _sent.Last(s => s.To == toEmail).Code;
+    }
 
     public Task SendLoginCodeAsync(string toEmail, string code, CancellationToken ct = default)
     {
-        lock (_recipients) { _recipients.Add(toEmail); LastCode = code; }
+        lock (_sent) _sent.Add((toEmail, code));
         return Task.CompletedTask;
     }
 }

@@ -2,6 +2,7 @@
 package app
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"github.com/activout/nordray.whiterabbit/cli/internal/passthrough"
 	"github.com/activout/nordray.whiterabbit/cli/internal/secrets"
 	"github.com/activout/nordray.whiterabbit/cli/internal/skill"
+	"golang.org/x/term"
 )
 
 // Version is set at build time with -ldflags "-X .../internal/app.Version=v1.2.3".
@@ -43,10 +45,11 @@ type App struct {
 	StderrIsTTY    bool
 	Self           string // this executable, so RABBIT_BUNNY cannot point at it
 
-	selected config.Selected
-	ciOnce   sync.Once
-	ciToken  string
-	ciErr    error
+	selected     config.Selected
+	capabilities string // --capabilities; wins over RABBIT_CAPABILITIES
+	ciOnce       sync.Once
+	ciToken      string
+	ciErr        error
 }
 
 // New returns an App wired to the real process.
@@ -94,16 +97,21 @@ func (a *App) run(ctx context.Context, args []string) (int, error) {
 		switch {
 		case arg == "--":
 			return a.passthrough(ctx, envFlag, serverFlag, args[i+1:])
-		case arg == "--env" || arg == "--server":
+		case arg == "--env" || arg == "--server" || arg == "--capabilities":
 			if i+1 >= len(args) {
 				return 2, usageError{arg + " needs a value"}
 			}
-			if arg == "--env" {
+			switch arg {
+			case "--env":
 				envFlag = args[i+1]
-			} else {
+			case "--server":
 				serverFlag = args[i+1]
+			default:
+				a.capabilities = args[i+1]
 			}
 			i++
+		case strings.HasPrefix(arg, "--capabilities="):
+			a.capabilities = strings.TrimPrefix(arg, "--capabilities=")
 		case strings.HasPrefix(arg, "--env="):
 			envFlag = strings.TrimPrefix(arg, "--env=")
 		case strings.HasPrefix(arg, "--server="):
@@ -128,14 +136,15 @@ const usage = `rabbit: bunny.net through Nordray White Rabbit, without the real 
 
 Usage:
   rabbit [--env NAME | --server URL] <command>
-  rabbit [--env NAME | --server URL] -- <bunny arguments...>
+  rabbit [--env NAME | --server URL] [--capabilities a,b] -- <bunny arguments...>
 
 White Rabbit commands:
-  auth login [--capabilities a,b] [--no-browser]   Sign in with the browser (OIDC + PKCE)
+  auth login [--no-browser]                        Sign in with the browser (email code + PKCE)
   auth status                                      Show the environment and the session
   auth whoami [--json]                             Show the signed-in user or CI workload
   auth logout                                      Revoke and forget the session
   env list | add NAME URL | use NAME | remove NAME Manage White Rabbit servers
+  admin key set | rm                               Store or remove your bunny.net API key (read from stdin)
   admin bindings list | add ... | rm ID            Manage CI workload bindings (interactive session only)
   skill install [--dir DIR] | print                Install the AI agent skill (~/.claude/skills, ~/.agents/skills)
   version
@@ -147,7 +156,8 @@ Everything after the first standalone -- is passed unchanged to BunnyCLI (bunny)
 
 In GitHub Actions (permissions: id-token: write) and Forgejo Actions (enable-openid-connect: true) rabbit uses the
 job's own OIDC token automatically. Environment: RABBIT_SERVER or RABBIT_ENV select the server, RABBIT_AUTH=ci or
-interactive overrides detection, RABBIT_BUNNY points at BunnyCLI, RABBIT_DEBUG=1 logs forwarded requests.
+interactive overrides detection, RABBIT_BUNNY points at BunnyCLI, RABBIT_DEBUG=1 logs forwarded requests,
+RABBIT_CAPABILITIES=a,b (or --capabilities a,b) limits what the forwarded bunny command may do.
 `
 
 func (a *App) command(ctx context.Context, envFlag, serverFlag, name string, args []string) (int, error) {
@@ -173,11 +183,14 @@ func (a *App) command(ctx context.Context, envFlag, serverFlag, name string, arg
 		}
 		return 2, usageError{"unknown auth subcommand " + args[0]}
 	case "admin":
-		if len(args) < 2 || args[0] != "bindings" {
-			return 2, usageError{"usage: rabbit admin bindings list | add ... | rm ID"}
+		if len(args) < 2 || (args[0] != "bindings" && args[0] != "key") {
+			return 2, usageError{"usage: rabbit admin key set | rm, or rabbit admin bindings list | add ... | rm ID"}
 		}
 		if err := a.selectEnv(envFlag, serverFlag); err != nil {
 			return 1, err
+		}
+		if args[0] == "key" {
+			return a.bunnyKey(ctx, args[1], args[2:])
 		}
 		return a.bindings(ctx, args[1], args[2:])
 	case "skill":
@@ -399,7 +412,6 @@ func (a *App) exchangeCI(ctx context.Context, platform ci.Platform) (string, err
 func (a *App) login(ctx context.Context, args []string) (int, error) {
 	fs := flag.NewFlagSet("auth login", flag.ContinueOnError)
 	fs.SetOutput(a.Stderr)
-	capabilities := fs.String("capabilities", "", "comma-separated capabilities to request (default: all)")
 	noBrowser := fs.Bool("no-browser", false, "print the URL instead of opening a browser")
 	if err := fs.Parse(args); err != nil {
 		return 2, usageError{err.Error()}
@@ -408,50 +420,15 @@ func (a *App) login(ctx context.Context, args []string) (int, error) {
 		return 1, errors.New("interactive login is not used in CI: rabbit authenticates with the job's OIDC token automatically")
 	}
 	a.announce()
-	client := a.client()
-	cfg, err := client.Config(ctx)
-	if err != nil {
-		return 1, err
-	}
-	requested := make([]string, 0, len(cfg.Capabilities))
-	if *capabilities != "" {
-		known := make(map[string]bool, len(cfg.Capabilities))
-		names := make([]string, 0, len(cfg.Capabilities))
-		for _, c := range cfg.Capabilities {
-			known[c.Name] = true
-			names = append(names, c.Name)
-		}
-		for _, c := range strings.Split(*capabilities, ",") {
-			if c = strings.TrimSpace(c); c == "" {
-				continue
-			}
-			// An unknown name would be demanded at sign-in but can never be granted on the consent page.
-			if !known[c] {
-				return 2, usageError{fmt.Sprintf("unknown capability %q; this server offers: %s", c, strings.Join(names, ", "))}
-			}
-			requested = append(requested, c)
-		}
-	} else {
-		for _, c := range cfg.Capabilities {
-			requested = append(requested, c.Name)
-		}
-	}
-	discovery, err := client.Discovery(ctx)
-	if err != nil {
-		return 1, err
-	}
 	open := a.OpenBrowser
 	if *noBrowser {
 		open = nil
 	}
-	idToken, err := login.IDToken(ctx, discovery, login.Options{
-		Server: a.selected.URL, ClientId: cfg.DexClientId, Capabilities: requested,
-		OpenBrowser: open, Out: a.Stderr, HTTP: a.HTTP,
-	})
+	code, verifier, err := login.Code(ctx, login.Options{Server: a.selected.URL, OpenBrowser: open, Out: a.Stderr})
 	if err != nil {
 		return 1, err
 	}
-	s, err := client.Exchange(ctx, idToken)
+	s, err := a.client().ExchangeCode(ctx, code, verifier)
 	if err != nil {
 		return 1, err
 	}
@@ -459,8 +436,8 @@ func (a *App) login(ctx context.Context, args []string) (int, error) {
 		fmt.Fprintf(a.Stderr, "rabbit: warning: %v; the session is not saved and later commands will ask you to sign in again\n", err)
 	}
 	fmt.Fprintf(a.Stdout, "Signed in to %s as %s until %s.\n", a.selected.Label(), s.Principal.Email, s.ExpiresAt.Local().Format(time.RFC1123))
-	if len(s.Principal.Capabilities) > 0 {
-		fmt.Fprintf(a.Stdout, "Capabilities: %s\n", strings.Join(s.Principal.Capabilities, ", "))
+	if !s.Principal.HasBunnyKey {
+		fmt.Fprintln(a.Stdout, "No bunny.net API key is stored yet: run rabbit admin key set.")
 	}
 	return 0, nil
 }
@@ -521,7 +498,12 @@ func (a *App) whoami(ctx context.Context, args []string) (int, error) {
 			rows = append(rows, [2]string{"Binding", strconv.FormatInt(*p.BindingId, 10)})
 		}
 	}
+	bunnyKey := "stored"
+	if !p.HasBunnyKey {
+		bunnyKey = "not set (rabbit admin key set)"
+	}
 	rows = append(rows, [2]string{"Issuer", p.Issuer}, [2]string{"Capabilities", strings.Join(p.Capabilities, ", ")},
+		[2]string{"Bunny key", bunnyKey},
 		[2]string{"Session until", p.SessionExpiresAt.Local().Format(time.RFC1123)})
 	for _, r := range rows {
 		if r[1] != "" {
@@ -551,6 +533,58 @@ func (a *App) logout(ctx context.Context) (int, error) {
 	}
 	fmt.Fprintln(a.Stdout, "Signed out.")
 	return 0, nil
+}
+
+// ---------------------------------------------------------------- admin key
+
+// bunnyKey stores or removes the owner's bunny.net API key. The key is read from stdin, without echo on a terminal,
+// so it never appears in argv, shell history or the process list.
+func (a *App) bunnyKey(ctx context.Context, sub string, args []string) (int, error) {
+	if len(args) > 0 || (sub != "set" && sub != "rm" && sub != "remove") {
+		return 2, usageError{"usage: rabbit admin key set | rm (set reads the key from stdin)"}
+	}
+	if p, _ := a.ciPlatform(); p != ci.None {
+		return 1, errors.New("the bunny.net API key can only be managed from an interactive session, not from CI")
+	}
+	a.announce()
+	token, err := a.session(ctx)
+	if err != nil {
+		return 1, err
+	}
+	if sub != "set" {
+		if err := a.client().RemoveBunnyKey(ctx, token); err != nil {
+			return 1, err
+		}
+		fmt.Fprintln(a.Stdout, "Removed the bunny.net API key.")
+		return 0, nil
+	}
+	key, err := a.readSecret("bunny.net API key: ")
+	if err != nil {
+		return 1, err
+	}
+	if key == "" {
+		return 2, usageError{"no key given: type it at the prompt or pipe it in, e.g. rabbit admin key set < key.txt"}
+	}
+	if err := a.client().SetBunnyKey(ctx, token, key); err != nil {
+		return 1, err
+	}
+	fmt.Fprintln(a.Stdout, "Stored the bunny.net API key.")
+	return 0, nil
+}
+
+// readSecret prompts without echo when stdin is a terminal, and otherwise reads the first line of stdin.
+func (a *App) readSecret(prompt string) (string, error) {
+	if f, ok := a.Stdin.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+		fmt.Fprint(a.Stderr, prompt)
+		b, err := term.ReadPassword(int(f.Fd()))
+		fmt.Fprintln(a.Stderr)
+		return strings.TrimSpace(string(b)), err
+	}
+	line, err := bufio.NewReader(io.LimitReader(a.Stdin, 4096)).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
 }
 
 // ---------------------------------------------------------------- admin bindings
@@ -672,7 +706,19 @@ func (a *App) passthrough(ctx context.Context, envFlag, serverFlag string, args 
 		if err != nil {
 			return "", time.Time{}, err
 		}
-		c, err := a.client().Credential(ctx, token, nil)
+		// --capabilities or RABBIT_CAPABILITIES narrows the virtual credential, e.g. for an AI agent; the session
+		// itself has all.
+		list := a.capabilities
+		if list == "" {
+			list = a.Getenv("RABBIT_CAPABILITIES")
+		}
+		var capabilities []string
+		for _, c := range strings.Split(list, ",") {
+			if c = strings.TrimSpace(c); c != "" {
+				capabilities = append(capabilities, c)
+			}
+		}
+		c, err := a.client().Credential(ctx, token, capabilities)
 		if err != nil {
 			return "", time.Time{}, fmt.Errorf("getting a credential from White Rabbit: %w", err)
 		}
