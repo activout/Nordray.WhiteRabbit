@@ -99,7 +99,7 @@ New endpoints require a code review and an explicit entry in `BunnyOperationRegi
 
 ## Running locally
 
-Prerequisites: Docker, .NET 10 SDK.
+Prerequisites: Docker, .NET 11 SDK.
 
 ```bash
 # Start Mailpit (catches the login emails)
