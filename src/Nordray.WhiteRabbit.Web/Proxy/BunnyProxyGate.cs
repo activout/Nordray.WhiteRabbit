@@ -1,10 +1,7 @@
-using System.Security.Claims;
 using System.Security.Cryptography;
 using Microsoft.AspNetCore.DataProtection;
-using Nordray.WhiteRabbit.Core.Access;
 using Nordray.WhiteRabbit.Core.Federation;
 using Nordray.WhiteRabbit.Core.Models;
-using Nordray.WhiteRabbit.Core.Services;
 using Nordray.WhiteRabbit.Infrastructure.Database;
 using Nordray.WhiteRabbit.Web.Cli;
 using Yarp.ReverseProxy.Forwarder;
@@ -13,22 +10,18 @@ using Yarp.ReverseProxy.Model;
 namespace Nordray.WhiteRabbit.Web.Proxy;
 
 /// <summary>
-/// Decides every Bunny proxy request before YARP forwards it. A request authenticates with either
-/// <list type="bullet">
-/// <item>a virtual credential in <c>AccessKey</c> (from <c>/api/cli/credentials</c>), or</item>
-/// <item>a Dex token issued to a configured proxy client (<c>Proxy:AllowedClientIds</c>).</item>
-/// </list>
-/// Both resolve to an owner and a set of effective capabilities; then the registry's capability is required and
+/// Decides every Bunny proxy request before YARP forwards it. A request authenticates with a virtual credential in
+/// <c>AccessKey</c> (from <c>/api/cli/credentials</c>), which resolves to an owner and a set of effective
+/// capabilities; then the registry's capability is required and
 /// the owner's own Bunny key is injected server side. The inbound <c>AccessKey</c> and <c>Authorization</c> headers
 /// are always removed by the route transforms, so neither is forwarded upstream.
 /// </summary>
-public sealed class BunnyProxyGate(
-    ProxyClientOptions proxyClients,
-    SignInPolicy signInPolicy,
-    IDataProtectionProvider dataProtection)
+public sealed class BunnyProxyGate(IDataProtectionProvider dataProtection)
 {
     public const string AccessKeyItem = "bunny.access-key";
-    private readonly IDataProtector _bunnyKeyProtector = dataProtection.CreateProtector("BunnyApiKey.v1");
+    /// <summary>Data Protection purpose for the stored Bunny API keys. Changing it makes every stored key unreadable.</summary>
+    public const string KeyPurpose = "BunnyApiKey.v1";
+    private readonly IDataProtector _bunnyKeyProtector = dataProtection.CreateProtector(KeyPurpose);
 
     private sealed record Caller(User Owner, IReadOnlySet<string> Capabilities, SecurityEvent Audit);
 
@@ -39,9 +32,7 @@ public sealed class BunnyProxyGate(
         var audit = ctx.RequestServices.GetRequiredService<SecurityAudit>();
         var now = DateTime.UtcNow;
 
-        var (caller, denial) = ctx.Request.Headers.ContainsKey("AccessKey")
-            ? await FromVirtualKeyAsync(ctx, now)
-            : await FromDexTokenAsync(ctx);
+        var (caller, denial) = await FromVirtualKeyAsync(ctx, now);
 
         if (caller is null)
         {
@@ -72,7 +63,7 @@ public sealed class BunnyProxyGate(
             if (reason is not null)
             {
                 await audit.RecordAsync(allowedEvent with { Outcome = SecurityEvent.Denied, Reason = reason, HttpStatus = 403 });
-                await WriteError(ctx, 403, """{"error":"bunny_api_key_not_configured","detail":"Go to /settings to add your bunny.net API key."}""");
+                await WriteError(ctx, 403, """{"error":"bunny_api_key_not_configured","detail":"Run rabbit admin key set to add your bunny.net API key."}""");
                 return;
             }
             ctx.Items[AccessKeyItem] = plaintextKey;
@@ -101,6 +92,8 @@ public sealed class BunnyProxyGate(
         var key = ctx.Request.Headers["AccessKey"].ToString();
         var denied = new SecurityEvent { EventType = "proxy.request", Outcome = SecurityEvent.Denied };
 
+        if (string.IsNullOrEmpty(key))
+            return (null, (401, """{"error":"unauthenticated"}""", denied with { Reason = "unauthenticated" }));
         // Anything that is not a White Rabbit virtual key, including a real Bunny key, is refused outright.
         if (!OpaqueToken.LooksLike(key, OpaqueToken.VirtualKeyPrefix))
             return (null, (401, """{"error":"invalid_access_key"}""", denied with { Reason = "invalid_access_key" }));
@@ -137,34 +130,6 @@ public sealed class BunnyProxyGate(
         var effective = NameList.Parse(credential.Capabilities).Where(resolved.Principal.Capabilities.Contains).ToHashSet(StringComparer.Ordinal);
         var audit = resolved.Principal.Describe("proxy.request", SecurityEvent.Allowed) with { CredentialId = credential.Id };
         return (new Caller(resolved.Principal.Owner, effective, audit), null);
-    }
-
-    private async Task<(Caller?, (int, string, SecurityEvent)?)> FromDexTokenAsync(HttpContext ctx)
-    {
-        var denied = new SecurityEvent { EventType = "proxy.request", Outcome = SecurityEvent.Denied };
-
-        if (ctx.User.Identity?.IsAuthenticated != true)
-            return (null, (401, """{"error":"unauthenticated"}""", denied with { Reason = "unauthenticated" }));
-
-        // azp (authorized party) wins; otherwise the token must have exactly one audience. Cookie sessions have
-        // neither and must use a registered OIDC client instead.
-        var email = ctx.User.FindFirstValue(ClaimTypes.Email);
-        var clientId = OidcClientIdentity.Resolve(ctx.User, proxyClients.AllowedClientIds);
-        denied = denied with { PrincipalType = PrincipalTypes.Human, Subject = ctx.User.FindFirstValue(ClaimTypes.NameIdentifier), ClientId = clientId };
-        if (clientId is null)
-            return (null, (403, """{"error":"proxy_requires_oidc","detail":"The proxy is only accessible via OIDC client tokens. Use a registered client application."}""",
-                denied with { Reason = "no_oidc_client" }));
-
-        if (!signInPolicy.IsAllowed(email))
-            return (null, (403, """{"error":"user_not_allowed"}""", denied with { Reason = "user_not_allowed" }));
-
-        var owner = await ctx.RequestServices.GetRequiredService<IUserRepository>().FindByEmailAsync(email!);
-        if (owner is null)
-            return (null, (403, """{"error":"user_not_allowed"}""", denied with { Reason = "owner_missing" }));
-
-        var granted = await ctx.RequestServices.GetRequiredService<IGrantService>().GetGrantedCapabilitiesAsync(owner.Email, clientId);
-        var audit = denied with { Outcome = SecurityEvent.Allowed, UserId = owner.Id, Issuer = ctx.User.FindFirstValue("iss") };
-        return (new Caller(owner, granted, audit), null);
     }
 
     /// <summary>Returns a denial reason, or null with the decrypted key.</summary>

@@ -1,11 +1,9 @@
 using System.Net;
-using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.IdentityModel.Tokens;
-using RichardSzalay.MockHttp;
 
 namespace Nordray.WhiteRabbit.Tests.Integration;
 
@@ -132,46 +130,6 @@ public partial class WebApplicationTests : IAsyncLifetime
         Assert.Equal("/", response.Headers.Location!.OriginalString);
     }
 
-    [Fact]
-    public async Task ConsentDeny_NeverRedirectsToTheRequestedRedirectUri()
-    {
-        var client = _factory.CreateHttpsClient();
-        await SignInAsync(client, "/");
-        var returnUrl = "/auth?client_id=example-client&scope=openid%20pullzone.read&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&state=s";
-        var form = await client.GetStringAsync("/consent?returnUrl=" + Uri.EscapeDataString(returnUrl));
-
-        var response = await client.PostAsync("/consent?handler=Deny", new FormUrlEncodedContent(new Dictionary<string, string>
-        {
-            ["ReturnUrl"] = returnUrl,
-            ["__RequestVerificationToken"] = AntiforgeryToken().Match(form).Groups[1].Value,
-        }));
-
-        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
-        Assert.Equal("/", response.Headers.Location!.OriginalString);
-    }
-
-    // --- Dex never sees a client-supplied identity header ---
-
-    [Fact]
-    public async Task DexCallback_ForgedRemoteUser_IsNotForwarded()
-    {
-        HttpRequestMessage? forwarded = null;
-        _factory.Upstream.When("http://127.0.0.1:9/*").Respond(request =>
-        {
-            forwarded = request;
-            return new HttpResponseMessage(HttpStatusCode.OK);
-        });
-        var request = new HttpRequestMessage(HttpMethod.Get, "/callback/white-rabbit-authproxy?state=s");
-        request.Headers.Add("X-Remote-User", "victim@example.com");
-        request.Headers.Add("X-Remote-Groups", "admins");
-
-        await _factory.CreateHttpsClient().SendAsync(request);
-
-        Assert.NotNull(forwarded);
-        Assert.False(forwarded.Headers.Contains("X-Remote-User"));
-        Assert.False(forwarded.Headers.Contains("X-Remote-Groups"));
-    }
-
     private async Task RequestCodeAsync(HttpClient client, string email)
     {
         var form = await client.GetStringAsync("/login");
@@ -190,71 +148,32 @@ public partial class WebApplicationTests : IAsyncLifetime
         return await client.PostAsync("/LoginVerify", new FormUrlEncodedContent(new Dictionary<string, string>
         {
             ["Email"] = WhiteRabbitFactory.AllowedEmail,
-            ["Code"] = _factory.Emails.LastCode!,
+            ["Code"] = _factory.Emails.LastCode(WhiteRabbitFactory.AllowedEmail),
             ["ReturnUrl"] = returnUrl,
             ["__RequestVerificationToken"] = AntiforgeryToken().Match(form).Groups[1].Value,
         }));
     }
 
-    // --- Proxy: audience and client identity ---
+    // --- Proxy: only virtual credentials ---
 
-    [Fact]
-    public async Task Proxy_TokenForConfiguredClient_ReachesTheCapabilityCheck()
+    [Theory]
+    [InlineData(null)]
+    [InlineData("Bearer eyJhbGciOiJSUzI1NiJ9.e30.x")]
+    public async Task Proxy_WithoutVirtualCredential_IsUnauthorized(string? authorization)
     {
-        await EnsureUserAsync(WhiteRabbitFactory.AllowedEmail);
-        await AssertProxy(WhiteRabbitFactory.Token(), HttpStatusCode.Forbidden, "capability_not_granted");
+        var request = new HttpRequestMessage(HttpMethod.Get, "/proxy/api.bunny.net/statistics");
+        if (authorization is not null) request.Headers.TryAddWithoutValidation("Authorization", authorization);
+        var response = await _factory.CreateHttpsClient().SendAsync(request);
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Contains("\"error\":\"unauthenticated\"", await response.Content.ReadAsStringAsync());
     }
 
     [Fact]
-    public async Task Proxy_AzpOfConfiguredClient_IsAccepted()
+    public async Task Proxy_UnsupportedOperation_IsNotFound()
     {
-        await EnsureUserAsync(WhiteRabbitFactory.AllowedEmail);
-        await AssertProxy(
-            WhiteRabbitFactory.Token(audiences: [WhiteRabbitFactory.ProxyClient, "other"], azp: WhiteRabbitFactory.ProxyClient),
-            HttpStatusCode.Forbidden, "capability_not_granted");
+        var response = await _factory.CreateHttpsClient().GetAsync("/proxy/api.bunny.net/no/such/endpoint");
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
     }
-
-    [Fact]
-    public async Task Proxy_TokenForUserWhoNeverSignedIn_IsForbidden() =>
-        await AssertProxy(WhiteRabbitFactory.Token(), HttpStatusCode.Forbidden, "user_not_allowed");
-
-    [Fact]
-    public async Task Proxy_TokenForAnotherAudience_IsUnauthorized() =>
-        await AssertProxy(WhiteRabbitFactory.Token(audiences: ["some-other-client"]), HttpStatusCode.Unauthorized);
-
-    [Fact]
-    public async Task Proxy_SeveralAudiencesWithoutAzp_IsRejected() =>
-        await AssertProxy(
-            WhiteRabbitFactory.Token(audiences: [WhiteRabbitFactory.ProxyClient, "other"]),
-            HttpStatusCode.Forbidden, "proxy_requires_oidc");
-
-    [Fact]
-    public async Task Proxy_AzpNotAmongAudiences_IsRejected() =>
-        await AssertProxy(
-            WhiteRabbitFactory.Token(audiences: [WhiteRabbitFactory.ProxyClient], azp: "other"),
-            HttpStatusCode.Forbidden, "proxy_requires_oidc");
-
-    [Fact]
-    public async Task Proxy_WrongIssuer_IsUnauthorized() =>
-        await AssertProxy(WhiteRabbitFactory.Token(issuer: "https://codebahn.net/api/actions"), HttpStatusCode.Unauthorized);
-
-    [Fact]
-    public async Task Proxy_WrongSignature_IsUnauthorized() =>
-        await AssertProxy(
-            WhiteRabbitFactory.Token(key: new SymmetricSecurityKey(RandomNumberGenerator.GetBytes(32))),
-            HttpStatusCode.Unauthorized);
-
-    [Fact]
-    public async Task Proxy_ExpiredToken_IsUnauthorized() =>
-        await AssertProxy(WhiteRabbitFactory.Token(expires: DateTime.UtcNow.AddMinutes(-10)), HttpStatusCode.Unauthorized);
-
-    [Fact]
-    public async Task Proxy_UserNotOnAllowList_IsForbidden() =>
-        await AssertProxy(WhiteRabbitFactory.Token(email: "stranger@example.org"), HttpStatusCode.Forbidden, "user_not_allowed");
-
-    [Fact]
-    public async Task Proxy_UnsupportedOperation_IsNotFound() =>
-        await AssertProxy(WhiteRabbitFactory.Token(), HttpStatusCode.NotFound, path: "/proxy/api.bunny.net/no/such/endpoint");
 
     // --- Data Protection key ring ---
 
@@ -313,48 +232,109 @@ public partial class WebApplicationTests : IAsyncLifetime
         Assert.Contains("no Data Protection key ring", error.Message);
     }
 
-    // --- Bearer tokens only on proxy routes ---
+    // --- rabbit CLI browser sign-in ---
 
-    [Theory]
-    [InlineData("/settings")]
-    [InlineData("/auth?client_id=example-client&response_type=code&redirect_uri=http://127.0.0.1/cb")]
-    public async Task DexBearerToken_DoesNotSignInToUiOrDexRoutes(string path)
-    {
-        var request = new HttpRequestMessage(HttpMethod.Get, path);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", WhiteRabbitFactory.Token());
+    private const string Verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    private const string Challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"; // RFC 7636 appendix B
+    private const string State = "state-0123456789abcdef";
 
-        var response = await _factory.CreateHttpsClient().SendAsync(request);
-
-        // Treated as signed out: sent to the login page rather than served or forwarded to Dex.
-        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
-        var location = response.Headers.Location!;
-        Assert.StartsWith("/login", location.IsAbsoluteUri ? location.AbsolutePath : location.OriginalString, StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>Starts the app (which migrates the database) and creates the user, as a real login would.</summary>
-    private async Task<long> EnsureUserAsync(string email)
-    {
-        await _factory.CreateHttpsClient().GetAsync("/health");
-        await using var connection = _db.Factory.Create();
-        var users = TestDatabase.Dao<Nordray.WhiteRabbit.Infrastructure.Database.IUserRepository>(connection);
-        if (await users.FindByEmailAsync(email) is null)
-            await users.InsertAsync(new Nordray.WhiteRabbit.Core.Models.User
-            {
-                Subject = "subject-" + email, Email = email, CreatedUtc = DateTime.UtcNow, LastLoginUtc = DateTime.UtcNow,
-            });
-        return (await users.FindByEmailAsync(email))!.Id;
-    }
-
-    private async Task AssertProxy(string token, HttpStatusCode expected, string? error = null, string path = "/proxy/api.bunny.net/statistics")
+    [Fact]
+    public async Task CliLogin_EmailCodeThenConfirm_RedirectsToLoopbackWithACodeTheVerifierRedeems()
     {
         var client = _factory.CreateHttpsClient();
-        var request = new HttpRequestMessage(HttpMethod.Get, path);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        var response = await client.SendAsync(request);
-        Assert.Equal(expected, response.StatusCode);
-        if (error is not null)
-            Assert.Contains($"\"error\":\"{error}\"", await response.Content.ReadAsStringAsync());
+        var start = $"/cli/login?port=53682&state={State}&code_challenge={Challenge}";
+
+        var response = await client.GetAsync(start);
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        Assert.StartsWith("/login", PathOf(response), StringComparison.OrdinalIgnoreCase);
+        var returnUrl = System.Web.HttpUtility.ParseQueryString(response.Headers.Location!.Query)["ReturnUrl"];
+        Assert.Equal(start, returnUrl);
+
+        // The ordinary email-code sign-in, with the return URL carried through.
+        var form = await client.GetStringAsync("/login");
+        await client.PostAsync("/login", Form(form, ("Email", WhiteRabbitFactory.AllowedEmail), ("ReturnUrl", returnUrl!)));
+        form = await client.GetStringAsync($"/LoginVerify?email={WhiteRabbitFactory.AllowedEmail}");
+        response = await client.PostAsync("/LoginVerify", Form(form,
+            ("Email", WhiteRabbitFactory.AllowedEmail), ("Code", _factory.Emails.LastCode(WhiteRabbitFactory.AllowedEmail)), ("ReturnUrl", returnUrl!)));
+        Assert.Equal(start, response.Headers.Location!.OriginalString);
+
+        // An explicit confirmation (POST with antiforgery) before any code is issued.
+        form = await client.GetStringAsync(start);
+        Assert.Contains(WhiteRabbitFactory.AllowedEmail, form);
+        response = await client.PostAsync(start, Form(form, ("Port", "53682"), ("State", State), ("CodeChallenge", Challenge)));
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        var callback = response.Headers.Location!;
+        Assert.Equal("http://127.0.0.1:53682/callback", callback.GetLeftPart(UriPartial.Path));
+        var query = System.Web.HttpUtility.ParseQueryString(callback.Query);
+        Assert.Equal(State, query["state"]);
+
+        var exchange = await client.PostAsync("/api/cli/exchange", JsonContent.Create(new { code = query["code"], code_verifier = Verifier }));
+        Assert.Equal(HttpStatusCode.OK, exchange.StatusCode);
     }
+
+    [Theory]
+    [InlineData("port=80&state=" + State + "&code_challenge=" + Challenge)]
+    [InlineData("port=53682&state=short&code_challenge=" + Challenge)]
+    [InlineData("port=53682&state=" + State + "&code_challenge=plain")]
+    [InlineData("port=53682&state=" + State)]
+    public async Task CliLogin_InvalidParameters_IssueNoCode(string query)
+    {
+        var client = await SignedInClientAsync();
+        var page = await client.GetStringAsync("/cli/login?" + query);
+        Assert.Contains("not valid", page);
+        Assert.DoesNotContain("<form", page);
+
+        // Posting anyway does not redirect anywhere.
+        var form = await client.GetStringAsync($"/cli/login?port=53682&state={State}&code_challenge={Challenge}");
+        var parsed = System.Web.HttpUtility.ParseQueryString(query);
+        var response = await client.PostAsync("/cli/login", Form(form,
+            ("Port", parsed["port"] ?? ""), ("State", parsed["state"] ?? ""), ("CodeChallenge", parsed["code_challenge"] ?? "")));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task CliLogin_WithoutAntiforgeryToken_IsRefused()
+    {
+        var client = await SignedInClientAsync();
+        var response = await client.PostAsync("/cli/login", new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["Port"] = "53682", ["State"] = State, ["CodeChallenge"] = Challenge,
+        }));
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task CliLogin_BearerTokenDoesNotSignIn()
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, $"/cli/login?port=53682&state={State}&code_challenge={Challenge}");
+        request.Headers.TryAddWithoutValidation("Authorization", "Bearer wrs_" + new string('A', 43));
+        var response = await _factory.CreateHttpsClient().SendAsync(request);
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        Assert.StartsWith("/login", PathOf(response), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task<HttpClient> SignedInClientAsync()
+    {
+        var client = _factory.CreateHttpsClient();
+        var form = await client.GetStringAsync("/login");
+        await client.PostAsync("/login", Form(form, ("Email", WhiteRabbitFactory.AllowedEmail)));
+        form = await client.GetStringAsync($"/LoginVerify?email={WhiteRabbitFactory.AllowedEmail}");
+        var response = await client.PostAsync("/LoginVerify", Form(form,
+            ("Email", WhiteRabbitFactory.AllowedEmail), ("Code", _factory.Emails.LastCode(WhiteRabbitFactory.AllowedEmail))));
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        return client;
+    }
+
+    private static string PathOf(HttpResponseMessage response)
+    {
+        var location = response.Headers.Location!;
+        return location.IsAbsoluteUri ? location.AbsolutePath : location.OriginalString;
+    }
+
+    /// <summary>The form's fields plus the page's antiforgery token.</summary>
+    private static FormUrlEncodedContent Form(string page, params (string Name, string Value)[] fields) =>
+        new(fields.Select(f => KeyValuePair.Create(f.Name, f.Value))
+            .Append(KeyValuePair.Create("__RequestVerificationToken", AntiforgeryToken().Match(page).Groups[1].Value)));
 
     [GeneratedRegex("name=\"__RequestVerificationToken\" type=\"hidden\" value=\"([^\"]+)\"")]
     private static partial Regex AntiforgeryToken();

@@ -1,5 +1,8 @@
 # Nordray White Rabbit, requirements specification v1
 
+> **Superseded in part.** White Rabbit no longer includes Dex, third-party OIDC clients, the consent screen or grants:
+> it is now a CI/CD key broker (see README.md and AGENTS.md). The sections on those parts are kept as history only.
+
 ## document status
 
 This is a handover-oriented requirements specification for version 1 of **Nordray White Rabbit**.

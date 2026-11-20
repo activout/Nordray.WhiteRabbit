@@ -1,0 +1,22 @@
+@page "/cli/login"
+@model CliLoginModel
+@{
+    ViewData["Title"] = "Sign in the rabbit CLI";
+}
+
+<h1>Sign in the rabbit CLI</h1>
+@if (Model.ErrorMessage is not null)
+{
+    <p class="error">@Model.ErrorMessage</p>
+}
+else
+{
+    <p>The rabbit CLI on this computer asks to act as <strong>@Model.Email</strong> with your bunny.net API key.</p>
+    <p class="hint">Only continue if you just ran <code>rabbit auth login</code>.</p>
+    <form method="post">
+        <input type="hidden" asp-for="Port" />
+        <input type="hidden" asp-for="State" />
+        <input type="hidden" asp-for="CodeChallenge" />
+        <button type="submit">Sign in rabbit</button>
+    </form>
+}

@@ -31,23 +31,21 @@ public sealed class OidcMetadataProvider(IHttpClientFactory httpClients, IHostEn
         _managers.GetOrAdd(issuerUrl, url => new ConfigurationManager<OpenIdConnectConfiguration>(
             url.TrimEnd('/') + "/.well-known/openid-configuration",
             new OpenIdConnectConfigurationRetriever(),
-            // Local Dex runs on http://localhost; everything else must be HTTPS.
+            // Development may use a local http:// issuer; everything else must be HTTPS.
             new HttpDocumentRetriever(httpClients.CreateClient("oidc-metadata")) { RequireHttps = !environment.IsDevelopment() }));
 }
 
 /// <summary>A validated token: who issued it and its claims.</summary>
-public sealed record ValidatedToken(string IssuerUrl, TrustedIssuer? Workload, JsonWebToken Token);
+public sealed record ValidatedToken(string IssuerUrl, TrustedIssuer Workload, JsonWebToken Token);
 
 /// <summary>
-/// Validates identity tokens presented to <c>/api/cli/exchange</c>. Each issuer is checked on its own terms:
-/// Dex ID tokens must be for the rabbit CLI client; CI tokens must be for this environment's federation audience.
-/// Signature (RS256 only), issuer, audience, expiry and not-before are always verified, and CI tokens must be short-lived.
+/// Validates CI identity tokens presented to <c>/api/cli/exchange</c>: they must come from a trusted issuer and be
+/// for this environment's federation audience. Signature (RS256 only), issuer, audience, expiry and not-before are
+/// always verified, and the tokens must be short-lived.
 /// </summary>
 public sealed class IdentityTokenValidator(
     IOidcMetadataProvider metadata,
-    IOptions<CliOptions> cli,
-    IOptions<FederationOptions> federation,
-    IConfiguration configuration)
+    IOptions<FederationOptions> federation)
 {
     private static readonly string[] AllowedAlgorithms = [SecurityAlgorithms.RsaSha256];
     private readonly JsonWebTokenHandler _handler = new() { MapInboundClaims = false };
@@ -72,33 +70,18 @@ public sealed class IdentityTokenValidator(
         if (!AllowedAlgorithms.Contains(algorithm, StringComparer.Ordinal))
             return new Result(null, "algorithm_not_allowed", issuer);
 
-        var dexIssuer = configuration["Dex:IssuerUrl"];
         var workload = federation.Value.Issuers.FirstOrDefault(i => string.Equals(i.Url, issuer, StringComparison.Ordinal));
-
-        string audience;
-        if (!string.IsNullOrEmpty(dexIssuer) && string.Equals(issuer, dexIssuer, StringComparison.Ordinal))
-            audience = cli.Value.DexClientId;
-        else if (workload is not null && !string.IsNullOrEmpty(federation.Value.Audience))
-            audience = federation.Value.Audience;
-        else
+        if (workload is null || string.IsNullOrEmpty(federation.Value.Audience))
             return new Result(null, "untrusted_issuer", issuer);
 
-        var validation = await ValidateWithIssuerAsync(token, issuer, audience, ct);
+        var validation = await ValidateWithIssuerAsync(token, issuer, federation.Value.Audience, ct);
         if (!validation.IsValid)
             return new Result(null, Reason(validation.Exception), issuer);
 
         var jwt = (JsonWebToken)validation.SecurityToken;
-        if (workload is null)
-        {
-            if (jwt.IssuedAt == DateTime.MinValue || DateTime.UtcNow - jwt.IssuedAt > cli.Value.MaxDexTokenAge)
-                return new Result(null, "token_too_old", issuer);
-        }
-        else
-        {
-            // CI tokens are meant to live minutes; refuse long-lived ones even if correctly signed.
-            if (jwt.IssuedAt == DateTime.MinValue || jwt.ValidTo - jwt.IssuedAt > federation.Value.MaxTokenLifetime)
-                return new Result(null, "token_lifetime_too_long", issuer);
-        }
+        // CI tokens are meant to live minutes; refuse long-lived ones even if correctly signed.
+        if (jwt.IssuedAt == DateTime.MinValue || jwt.ValidTo - jwt.IssuedAt > federation.Value.MaxTokenLifetime)
+            return new Result(null, "token_lifetime_too_long", issuer);
         return new Result(new ValidatedToken(issuer, workload, jwt), null, issuer);
     }
 
@@ -155,7 +138,7 @@ public sealed class IdentityTokenValidator(
     {
         var t = validated.Token;
         string? Claim(string name) => t.TryGetPayloadValue<string>(name, out var v) && !string.IsNullOrEmpty(v) ? v : null;
-        var issuer = validated.Workload!;
+        var issuer = validated.Workload;
         var github = issuer.Kind == IssuerKind.GitHub;
         return new WorkloadIdentity
         {

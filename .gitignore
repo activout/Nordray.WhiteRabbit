@@ -2,7 +2,7 @@
 bin/
 obj/
 
-# Local data (SQLite databases, Dex state)
+# Local data (SQLite databases)
 data/
 
 # Secrets — never commit real values

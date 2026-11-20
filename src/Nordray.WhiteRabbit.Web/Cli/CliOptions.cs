@@ -5,14 +5,8 @@ namespace Nordray.WhiteRabbit.Web.Cli;
 /// <summary>Settings for the rabbit CLI endpoints (<c>Cli</c> section).</summary>
 public sealed class CliOptions
 {
-    /// <summary>The public Dex client the rabbit CLI signs in with. Its ID tokens are exchanged for sessions.</summary>
-    public string DexClientId { get; set; } = "rabbit-cli";
-
-    /// <summary>
-    /// How old a Dex ID token may be when it is exchanged. The CLI exchanges it right after the browser login, so a
-    /// token that was captured and replayed later is refused even though Dex itself would still accept it.
-    /// </summary>
-    public TimeSpan MaxDexTokenAge { get; set; } = TimeSpan.FromMinutes(10);
+    /// <summary>How long a <c>/cli/login</c> code may wait for the CLI to redeem it. The CLI does so at once.</summary>
+    public TimeSpan LoginCodeLifetime { get; set; } = TimeSpan.FromMinutes(2);
 
     public TimeSpan HumanSessionLifetime { get; set; } = TimeSpan.FromHours(8);
     public TimeSpan WorkloadSessionLifetime { get; set; } = TimeSpan.FromMinutes(60);

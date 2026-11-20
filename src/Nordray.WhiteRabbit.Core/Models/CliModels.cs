@@ -32,6 +32,18 @@ public sealed record WorkloadBinding
     public DateTime? RevokedUtc { get; init; }
 }
 
+/// <summary>A one-time code from <c>/cli/login</c>, redeemed once by the CLI that holds the PKCE verifier.</summary>
+public sealed record CliLoginCode
+{
+    public long Id { get; init; }
+    public string CodeHash { get; init; } = "";
+    public string CodeChallenge { get; init; } = "";
+    public long UserId { get; init; }
+    public DateTime CreatedUtc { get; init; }
+    public DateTime ExpiresUtc { get; init; }
+    public DateTime? ConsumedUtc { get; init; }
+}
+
 public sealed record CliSession
 {
     public string Id { get; init; } = "";

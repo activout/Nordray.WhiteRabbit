@@ -10,7 +10,6 @@ using Nordray.WhiteRabbit.Core.Services;
 using Nordray.WhiteRabbit.Infrastructure.Database;
 using Nordray.WhiteRabbit.Infrastructure.Email;
 using Nordray.WhiteRabbit.Infrastructure.Encryption;
-using Nordray.WhiteRabbit.Infrastructure.Grants;
 using Nordray.WhiteRabbit.Infrastructure.LoginCodes;
 
 namespace Nordray.WhiteRabbit.Infrastructure;
@@ -32,10 +31,9 @@ public static class InfrastructureServiceExtensions
 
         AddDao<IUserRepository>(services);
         AddDao<ILoginCodeRepository>(services);
-        AddDao<IGrantDao>(services);
-        AddDao<ICapabilityDao>(services);
         AddDao<IDataProtectionKeyDao>(services);
         AddDao<IWorkloadBindingDao>(services);
+        AddDao<ICliLoginCodeDao>(services);
         AddDao<ICliSessionDao>(services);
         AddDao<IVirtualCredentialDao>(services);
         AddDao<ISecurityEventDao>(services);
@@ -64,9 +62,6 @@ public static class InfrastructureServiceExtensions
         // --- Login codes ---
         services.Configure<LoginCodeOptions>(configuration.GetSection("LoginCode"));
         services.AddScoped<ILoginCodeService, LoginCodeService>();
-
-        // --- Grants ---
-        services.AddScoped<IGrantService, GrantService>();
 
         return services;
     }

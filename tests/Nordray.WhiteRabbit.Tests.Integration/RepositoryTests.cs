@@ -1,8 +1,5 @@
-using Nordray.WhiteRabbit.Bunny;
 using Nordray.WhiteRabbit.Core.Models;
 using Nordray.WhiteRabbit.Infrastructure.Database;
-using Nordray.WhiteRabbit.Infrastructure.Grants;
-using Nordray.WhiteRabbit.Proxy;
 
 namespace Nordray.WhiteRabbit.Tests.Integration;
 
@@ -60,58 +57,23 @@ public class RepositoryTests
     }
 
     [Fact]
-    public async Task Grants_StoreReplaceAndRead()
+    public async Task CliLoginCodes_ConsumeOnceAndOnlyBeforeExpiry()
     {
         await using var db = await TestDatabase.CreateAsync();
         await using var connection = db.Factory.Create();
-        await TestDatabase.Dao<IUserRepository>(connection)
-            .InsertAsync(new User { Subject = "sub-1", Email = "a@example.com", CreatedUtc = Now, LastLoginUtc = Now });
-        await new CapabilitySeeder(TestDatabase.Dao<ICapabilityDao>(connection), new BunnyOperationRegistry()).SeedAsync();
-        var grants = new GrantService(TestDatabase.Dao<IGrantDao>(connection));
+        var users = TestDatabase.Dao<IUserRepository>(connection);
+        await users.InsertAsync(new User { Subject = "sub-1", Email = "a@example.com", CreatedUtc = Now, LastLoginUtc = Now });
+        var userId = (await users.FindByEmailAsync("a@example.com"))!.Id;
+        var codes = TestDatabase.Dao<ICliLoginCodeDao>(connection);
+        await codes.InsertAsync(new CliLoginCode { CodeHash = "h1", CodeChallenge = "c1", UserId = userId, CreatedUtc = Now, ExpiresUtc = Now.AddMinutes(2) });
+        await codes.InsertAsync(new CliLoginCode { CodeHash = "h2", CodeChallenge = "c2", UserId = userId, CreatedUtc = Now, ExpiresUtc = Now.AddMinutes(2) });
 
-        Assert.Empty(await grants.GetGrantedCapabilitiesAsync("a@example.com", "example-client"));
-
-        await grants.StoreGrantAsync("a@example.com", "example-client", ["pullzone.read", "statistics.read", "no.such.capability"]);
-        Assert.Equal(new HashSet<string> { "pullzone.read", "statistics.read" }, await grants.GetGrantedCapabilitiesAsync("a@example.com", "example-client"));
-
-        // A new grant replaces the old one rather than adding to it.
-        await grants.StoreGrantAsync("a@example.com", "example-client", ["statistics.read"]);
-        Assert.Equal(new HashSet<string> { "statistics.read" }, await grants.GetGrantedCapabilitiesAsync("a@example.com", "example-client"));
-
-        // Grants are per client.
-        Assert.Empty(await grants.GetGrantedCapabilitiesAsync("a@example.com", "other-client"));
-    }
-
-    [Fact]
-    public async Task Grants_UnknownUser_ThrowsAndWritesNothing()
-    {
-        await using var db = await TestDatabase.CreateAsync();
-        await using var connection = db.Factory.Create();
-        var grants = new GrantService(TestDatabase.Dao<IGrantDao>(connection));
-
-        await Assert.ThrowsAsync<InvalidOperationException>(() => grants.StoreGrantAsync("nobody@example.com", "example-client", ["statistics.read"]));
-
-        await using var check = db.Factory.Create();
-        await check.OpenAsync();
-        await using var command = check.CreateCommand();
-        command.CommandText = "SELECT COUNT(*) FROM OAuthClients";
-        Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync()));
-    }
-
-    [Fact]
-    public async Task CapabilitySeeder_IsIdempotentAndCoversTheRegistry()
-    {
-        await using var db = await TestDatabase.CreateAsync();
-        await using var connection = db.Factory.Create();
-        var capabilities = TestDatabase.Dao<ICapabilityDao>(connection);
-        var registry = new BunnyOperationRegistry();
-        var seeder = new CapabilitySeeder(capabilities, registry);
-
-        await seeder.SeedAsync();
-        await seeder.SeedAsync();
-
-        var expected = registry.GetAll().Select(op => op.RequiredCapability).OfType<string>().Distinct().Order(StringComparer.Ordinal);
-        Assert.Equal(expected, await capabilities.ListNamesAsync());
+        var consumed = await codes.ConsumeAsync("h1", Now.AddMinutes(1));
+        Assert.Equal(("c1", userId), (consumed!.CodeChallenge, consumed.UserId));
+        Assert.Equal(Now.AddMinutes(1), consumed.ConsumedUtc);
+        Assert.Null(await codes.ConsumeAsync("h1", Now.AddMinutes(1)));
+        Assert.Null(await codes.ConsumeAsync("h2", Now.AddMinutes(2)));
+        Assert.Null(await codes.ConsumeAsync("nope", Now));
     }
 
     [Fact]

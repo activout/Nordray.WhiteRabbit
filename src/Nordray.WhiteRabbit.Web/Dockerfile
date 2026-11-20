@@ -6,7 +6,6 @@ COPY Directory.Build.props ./
 COPY src/Nordray.WhiteRabbit.Core/Nordray.WhiteRabbit.Core.csproj                         src/Nordray.WhiteRabbit.Core/
 COPY src/Nordray.WhiteRabbit.Bunny/Nordray.WhiteRabbit.Bunny.csproj                       src/Nordray.WhiteRabbit.Bunny/
 COPY src/Nordray.WhiteRabbit.Infrastructure/Nordray.WhiteRabbit.Infrastructure.csproj     src/Nordray.WhiteRabbit.Infrastructure/
-COPY src/Nordray.WhiteRabbit.AuthProxy/Nordray.WhiteRabbit.AuthProxy.csproj               src/Nordray.WhiteRabbit.AuthProxy/
 COPY src/Nordray.WhiteRabbit.Proxy/Nordray.WhiteRabbit.Proxy.csproj                       src/Nordray.WhiteRabbit.Proxy/
 COPY src/Nordray.WhiteRabbit.Web/Nordray.WhiteRabbit.Web.csproj                           src/Nordray.WhiteRabbit.Web/
 

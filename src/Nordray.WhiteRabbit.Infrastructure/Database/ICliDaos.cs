@@ -28,6 +28,23 @@ public interface IWorkloadBindingDao
     Task<int> RevokeAsync([Bind("id")] long id, [Bind("ownerUserId")] long ownerUserId, [Bind("now")] DateTime now);
 }
 
+public interface ICliLoginCodeDao
+{
+    [SqlUpdate("""
+        INSERT INTO CliLoginCodes (CodeHash, CodeChallenge, UserId, CreatedUtc, ExpiresUtc)
+        VALUES (@CodeHash, @CodeChallenge, @UserId, @CreatedUtc, @ExpiresUtc)
+        """)]
+    Task InsertAsync([BindProperties] CliLoginCode code);
+
+    /// <summary>Consumes an unexpired, unused code and returns it; null if there is none. One statement, so a code is redeemed at most once.</summary>
+    [SqlQuery("""
+        UPDATE CliLoginCodes SET ConsumedUtc = @now
+        WHERE CodeHash = @codeHash AND ConsumedUtc IS NULL AND ExpiresUtc > @now
+        RETURNING *
+        """)]
+    Task<CliLoginCode?> ConsumeAsync([Bind("codeHash")] string codeHash, [Bind("now")] DateTime now);
+}
+
 public interface ICliSessionDao
 {
     [SqlUpdate("""

@@ -1,45 +1,45 @@
 # Nordray White Rabbit
 
-An open source **OIDC facade** in front of selected [bunny.net](https://bunny.net) APIs.
-
-White Rabbit makes bunny.net APIs available through modern user login and delegated client access — without exposing your bunny.net credentials to API consumers. It sits between your OIDC clients and bunny.net, enforcing capability-based access control and injecting credentials server-side.
+Keeps your **bunny.net API key out of CI/CD**. White Rabbit holds the key server side. GitHub Actions and Forgejo
+Actions jobs prove who they are with their own OIDC token, and get short-lived virtual credentials that can do only
+what you allowed that workflow.
 
 ## Why
 
-bunny.net does not provide native OIDC login for its APIs. If you want to give an application access to your pull zones, DNS zones, or Shield configuration without handing over your account API key, you need a layer in front. White Rabbit is that layer.
+bunny.net has one all-powerful account API key and no native OIDC or scoped keys. Putting that key in a CI secret
+means every workflow, and anyone who can change one, holds full control of the account. White Rabbit is the layer in
+between: a deploy job gets `mc.read` + `mc.deploy` for five minutes, and nothing else.
 
 ## How it works
 
 ```
-OIDC client (app, CLI, ...)
-        │
-        │  OIDC authorization flow
-        ▼
-┌───────────────────────────┐
-│        Dex (OIDC)         │  Issues tokens, manages clients
-└────────────┬──────────────┘
-             │  authproxy connector
-             ▼
-┌───────────────────────────┐
-│    Nordray White Rabbit   │
-│                           │
-│  • Email one-time code    │  User authentication
-│  • Consent screen         │  User approves client access
-│  • Capability checks      │  Deny by default
-│  • Credential injection   │  Your key, never exposed
-│  • YARP forwarding        │  Proxies to bunny.net
-│  • Audit logging          │
-└────────────┬──────────────┘
-             │
-             ▼
-        bunny.net APIs
+GitHub / Forgejo Actions job            you, at a terminal
+   │ job OIDC token                       │ rabbit auth login (browser + emailed code)
+   ▼                                      ▼
+┌──────────────────────────────────────────────────┐
+│              Nordray White Rabbit                │
+│  • token exchange      CI token / login code → session (wrs_…)
+│  • workload bindings   repository + ref + workflow → capabilities
+│  • virtual credentials wrk_…, 5 minutes          │
+│  • operation registry  deny by default (404/403) │
+│  • key injection       your bunny.net key, never returned
+│  • audit log           every decision            │
+└─────────────────────────┬────────────────────────┘
+                          ▼
+                   https://api.bunny.net
 ```
 
-1. A user signs in with their email address — White Rabbit sends a 6-digit one-time code.
-2. On first access from a client application, the user sees a consent screen listing the capabilities the client is requesting.
-3. Approved grants are stored in the database. Subsequent requests from the same client skip the consent step.
-4. White Rabbit looks up every incoming proxy request in a hard-coded operation registry. Anything not in the registry is rejected with `404`. Anything the client hasn't been granted is rejected with `403`.
-5. Approved requests have the user's bunny.net API key injected server-side and are forwarded to `https://api.bunny.net` via YARP.
+1. **Once, as the owner:** `rabbit auth login` signs you in with a 6-digit code sent by email. `rabbit admin key set`
+   stores your bunny.net API key, encrypted. `rabbit admin bindings add …` allows one workflow of one repository a set
+   of capabilities.
+2. **In CI:** `rabbit -- <bunny arguments>` exchanges the job's OIDC token. Only a job that matches a binding
+   exactly gets a session.
+3. Each BunnyCLI call goes through White Rabbit's proxy with a virtual credential. The operation must be in the
+   hard-coded registry (`404` otherwise) and its capability must be in the binding (`403` otherwise). Then the owner's
+   key is injected and the request is forwarded to `https://api.bunny.net`.
+
+The same `rabbit -- …` works at your own terminal, so an AI agent can run BunnyCLI without ever seeing the key
+(`RABBIT_CAPABILITIES=a,b` limits what it may do).
 
 ## Supported bunny.net APIs
 
@@ -69,7 +69,7 @@ Everything else, such as IDs and names, is returned unchanged. A successful resp
 
 **`mc.deploy` changes only the image.** Bunny's container update also accepts environment variables, endpoints, volumes, probes and the entry point. White Rabbit forwards only the image fields and refuses any other field (400), even when it is null or empty.
 
-**Each capability has one description**, in `BunnyOperationRegistry`, covering every operation it allows. The consent page, `rabbit` and the capability table all show that text.
+**Each capability has one description**, in `BunnyOperationRegistry`, covering every operation it allows. `rabbit` and the capability table both show that text.
 
 **Deletes are explicit.** `mc.manage` and `db.manage` can delete any app or database on the account, not just ones they created. Grant them only to bindings that need them, e.g. a workflow that cleans up preview deployments.
 
@@ -80,18 +80,18 @@ New endpoints require a code review and an explicit entry in `BunnyOperationRegi
 ## Security model
 
 - **Deny by default.** Every proxied operation is explicitly registered.
-- **Capability-based grants.** Clients request capabilities (`pullzone.read`, `dns.write`, …); users approve or deny.
-- **Credentials never leave the server.** The user's bunny.net API key is stored in the database and injected into outgoing requests. Clients never see it.
+- **Capability-based access.** Each workload binding lists the capabilities (`pullzone.read`, `mc.deploy`, …) its workflow may use; each virtual credential can be narrowed further.
+- **Credentials never leave the server.** The owner's bunny.net API key is stored encrypted in the database and injected into outgoing requests. CI jobs and the CLI never see it.
 - **Email one-time codes.** No passwords. Codes are SHA-256 hashed, expire in 10 minutes, and are invalidated after first use.
 - **Rate limiting.** Per-email and per-IP limits on code requests and verification attempts.
-- **Header stripping.** `AccessKey`, `Authorization`, and `X-Remote-*` headers are stripped from all inbound requests before forwarding.
+- **Header stripping.** Inbound `AccessKey`, `Authorization` and `X-Remote-*` headers are never forwarded to bunny.net.
 
 ## Technology stack
 
 | Concern | Choice |
 |---|---|
 | Web host | ASP.NET Core 10 |
-| OIDC provider | [Dex](https://dexidp.io) (authproxy connector) |
+| Token validation | `Microsoft.IdentityModel` (GitHub and Forgejo Actions OIDC tokens) |
 | Proxy forwarding | YARP (reverse proxy pipeline) |
 | Database | libSQL (a local file, or [Bunny Database](https://bunny.net/database/) when deployed) via [Activout.DatabaseClient](https://github.com/twogood/Activout.DatabaseClient) and its `LibSqlGateway` |
 | Email | Mailjet (SMTP/Mailpit fallback for local dev) |
@@ -102,17 +102,18 @@ New endpoints require a code review and an explicit entry in `BunnyOperationRegi
 Prerequisites: Docker, .NET 10 SDK.
 
 ```bash
-# Start Dex and Mailpit
-docker compose up dex mailpit
+# Start Mailpit (catches the login emails)
+docker compose up mailpit
 
-# Set the one required dev secret
-export WhiteRabbit_Dex__ClientSecret=change-me-in-production
+# The two required settings
+export WhiteRabbit_DataProtection__EncryptionKey=$(openssl rand -base64 32)
+export WhiteRabbit_Access__AllowedEmails__0=you@example.com
 
 # Run White Rabbit with hot reload
 dotnet watch --project src/Nordray.WhiteRabbit.Web
 ```
 
-Open [http://localhost:8080](http://localhost:8080) and sign in with your email. Check [http://localhost:8025](http://localhost:8025) (Mailpit) for the login code.
+Then `rabbit --server http://localhost:8080 auth login`, and look in [http://localhost:8025](http://localhost:8025) (Mailpit) for the code.
 
 To run everything in Docker:
 
@@ -129,7 +130,6 @@ Secrets are **never** stored in `appsettings` files. All sensitive values are su
 |---|---|
 | `WhiteRabbit_DataProtection__EncryptionKey` | **Required.** Base64 of 32 random bytes (`openssl rand -base64 32`). Encrypts the Data Protection key ring stored in the database, which in turn protects every stored bunny.net API key. Keep it with the database backup, separately protected: without it the stored keys cannot be read. White Rabbit refuses to start without it |
 | `WhiteRabbit_Database__ConnectionString` | `Data Source=<file>` locally, or `Data Source=https://<database>.lite.bunnydb.net;Auth Token=<token>` for Bunny Database |
-| `WhiteRabbit_Dex__ClientSecret` | Shared secret between White Rabbit and Dex |
 | `WhiteRabbit_Mailjet__ApiKey` | Mailjet API key (omit to use SMTP fallback) |
 | `WhiteRabbit_Mailjet__SecretKey` | Mailjet secret key |
 | `WhiteRabbit_Mailjet__FromEmail` | Sender address |
@@ -139,7 +139,6 @@ Non-secret settings that every instance must choose:
 | Setting | Purpose |
 |---|---|
 | `Access:AllowedEmails`, `Access:AllowedDomains` | Who may sign in (e.g. `WhiteRabbit_Access__AllowedEmails__0=you@example.com`). **Empty means nobody**, so an instance never collects strangers' bunny.net keys by accident. Removing an address ends its sessions and proxy access |
-| `Proxy:AllowedClientIds` | OIDC client IDs whose tokens the Bunny proxy accepts (e.g. `WhiteRabbit_Proxy__AllowedClientIds__0=example-client`). Tokens for any other audience are rejected. Empty means none |
 
 See [`.env.example`](.env.example) for a full template.
 
@@ -147,19 +146,22 @@ See [`.env.example`](.env.example) for a full template.
 
 The Go command-line client is in [`cli/`](cli/README.md) (install, usage, CI examples in [`examples/ci`](examples/ci)). The server side:
 
-The `rabbit` CLI never holds a real bunny.net key. It exchanges an identity token for a White Rabbit session, then
-asks for short-lived **virtual credentials** that only White Rabbit's proxy accepts.
+The `rabbit` CLI never holds a real bunny.net key. It exchanges a login code or a CI identity token for a White Rabbit
+session, then asks for short-lived **virtual credentials** that only White Rabbit's proxy accepts.
 
 | Endpoint | Auth | Purpose |
 |---|---|---|
-| `POST /api/cli/exchange` `{"subject_token": "…"}` | none (rate limited) | Exchanges a Dex ID token (client `rabbit-cli`, at most 10 minutes old), a GitHub Actions token or a Forgejo Actions token for a session token `wrs_…`. Humans get 8 hours, CI workloads 60 minutes |
+| `GET /cli/login?port=&state=&code_challenge=` | browser sign-in (email code) | After an explicit confirmation, redirects to `http://127.0.0.1:{port}/callback` with a one-time code `wrc_…` (2 minutes) bound to the PKCE S256 challenge |
+| `POST /api/cli/exchange` `{"code": "…", "code_verifier": "…"}` or `{"subject_token": "…"}` | none (rate limited) | Exchanges a login code with its verifier, or a GitHub Actions or Forgejo Actions token, for a session token `wrs_…`. Humans get 8 hours with every capability, CI workloads 60 minutes with their binding's |
 | `POST /api/cli/credentials` `{"capabilities": […]}` | `Authorization: Bearer wrs_…` | Issues a virtual credential `wrk_…` (5 minutes), never broader than the session. Send it as `AccessKey` to `/proxy/api.bunny.net/…` |
 | `GET /api/cli/whoami` | session | The authenticated human or workload and its current capabilities |
 | `POST /api/cli/revoke` `{"credential_id": "…"?}` | session | Revokes one credential, or the session and all its credentials |
 | `GET/POST /api/admin/bindings`, `DELETE /api/admin/bindings/{id}` | human session only | Lists, creates and revokes the caller's own CI workload bindings |
+| `PUT /api/admin/bunny-key` `{"api_key": "…"}`, `DELETE /api/admin/bunny-key` | human session only | Stores (encrypted) or removes the caller's bunny.net API key. Never returned; `whoami` only says `has_bunny_key` |
 
-- **Sessions and virtual credentials** are opaque random tokens; only their SHA-256 hashes are stored. They are checked on every use against the sign-in allow-list, the human's current grants for `rabbit-cli`, or the workload binding, so revoking any of those takes effect immediately.
-- **The proxy** accepts a virtual credential in `AccessKey`, or a Dex token issued to a client in `Proxy:AllowedClientIds`. Anything else in `AccessKey`, including a real bunny.net key, is refused and never forwarded. The owner's own stored key is injected server side.
+- **Sessions and virtual credentials** are opaque random tokens; only their SHA-256 hashes are stored. They are checked on every use against the sign-in allow-list and, for CI, the workload binding, so revoking either takes effect immediately.
+- **Login codes** are opaque, stored as SHA-256 hashes, valid for 2 minutes and consumed on first use, even when the verifier is wrong. The redirect always goes to `127.0.0.1`, never to a caller-supplied URL.
+- **The proxy** accepts only a virtual credential in `AccessKey`. Anything else, including a real bunny.net key, is refused and never forwarded. The owner's own stored key is injected server side.
 - **CI tokens** are validated per configured issuer: exact `iss`, audience `Federation:Audience`, RS256 only (checked before any key lookup), expiry and not-before, and a lifetime of at most `Federation:MaxTokenLifetime`. Signing keys come from the issuer's discovery document; only configured issuers are ever fetched.
 - **Workload bindings** decide what a CI identity may do. They are created only through the admin API by a human, never from repository content.
   - Every field is matched exactly: issuer, repository, ref (`refs/heads/…` or `refs/tags/…` only) and `workflow_ref`, whose `@ref` must equal the ref.
@@ -168,13 +170,11 @@ asks for short-lived **virtual credentials** that only White Rabbit's proxy acce
   - **GitHub** bindings also require the immutable `repository_id`, and optionally `repository_owner_id`, `environment` and `job_workflow_ref`.
   - **Forgejo** (tested on 15.0.12) does not issue IDs or environments. Its bindings match on names, so renaming or transferring a repository is a known risk. Forgejo's `ref_protected` claim is always `"false"` and is not used. Forgejo jobs must set `enable-openid-connect: true`.
   - Two matching bindings are refused as ambiguous.
-- **Dex**: `rabbit-cli` is a public client (no secret in the binary). White Rabbit rejects its authorization requests unless they use `response_type=code` with PKCE `S256`, because Dex itself accepts public-client logins without PKCE.
-
-Settings: `Cli:DexClientId`, `Cli:*Lifetime`, `Cli:MaxDexTokenAge`, `Federation:Audience` (distinct per environment, e.g. `whiterabbit:test`), `Federation:MaxTokenLifetime`, and `Federation:Issuers` (each `Name`, `Kind` = `GitHub` or `Forgejo`, and the exact `Url`). An empty audience or issuer list disables CI federation.
+Settings: `Cli:*Lifetime`, `Federation:Audience` (distinct per environment, e.g. `whiterabbit:test`), `Federation:MaxTokenLifetime`, and `Federation:Issuers` (each `Name`, `Kind` = `GitHub` or `Forgejo`, and the exact `Url`). An empty audience or issuer list disables CI federation.
 
 ### Audit
 
-Security events (`SecurityEvents` table and the structured log) record token exchanges, credential issuance, revocations, binding changes and every proxy decision. Each event records:
+Security events (`SecurityEvents` table and the structured log) record CLI sign-ins, token exchanges, credential issuance, bunny.net key changes, revocations, binding changes and every proxy decision. Each event records:
 - principal type, subject and issuer;
 - binding and session;
 - repository, workflow, ref and run;
@@ -195,12 +195,7 @@ The same libSQL provider serves a local file, an in-memory database in tests and
 
 ## Deployment
 
-White Rabbit is designed to run as a two-container application on [bunny.net Magic Containers](https://bunny.net/magic-containers/):
-
-- `white-rabbit` on port `8080`
-- `dex` on port `5556`
-
-Both containers communicate over `localhost`. White Rabbit's data, including the encrypted Data Protection key ring, lives in its database (Bunny Database when deployed); Dex keeps its own SQLite file on a persistent volume.
+White Rabbit runs as a single container (`white-rabbit` on port `8080`) on [bunny.net Magic Containers](https://bunny.net/magic-containers/). All its data, including the encrypted Data Protection key ring, lives in its database (Bunny Database when deployed), so the container needs no volume.
 
 **Image.** `.github/workflows/image.yml` publishes the server image to `ghcr.io/activout/nordray-whiterabbit`:
 - every push to `main` gets `:sha-<commit>` and `:main`;
@@ -212,26 +207,24 @@ The run summary shows the digest. Deploy a pinned digest, not a moving tag. The 
 
 ```
 src/
-  Nordray.WhiteRabbit.Web            ASP.NET Core host, Razor pages, middleware pipeline
+  Nordray.WhiteRabbit.Web            ASP.NET Core host, CLI API, sign-in pages, proxy pipeline
   Nordray.WhiteRabbit.Core           Domain types — BunnyOperation, capabilities, models
   Nordray.WhiteRabbit.Infrastructure libSQL DAOs and migrations, Mailjet/SMTP email service
   Nordray.WhiteRabbit.Proxy          BunnyHttpClientFactory, ISRG Root X1 certificate pinning
   Nordray.WhiteRabbit.Bunny          BunnyOperationRegistry (the hard-coded allow-list)
-  Nordray.WhiteRabbit.AuthProxy      DexAuthProxyMiddleware, X-Remote-User injection
 tests/
   Nordray.WhiteRabbit.Tests.Unit
   Nordray.WhiteRabbit.Tests.Integration
-deploy/
-  dex/config.yaml                    Dex configuration (authproxy connector)
-examples/
-  ExampleClient                      Sample OIDC client demonstrating the full login + proxy flow
+cli/                                 rabbit, the Go command-line client
+examples/ci/                         GitHub Actions and Forgejo Actions workflows
 ```
 
 ## What v1 deliberately does not include
 
 - OpenFGA or attribute-based policies
 - Resource-level scoping (per pull zone, per DNS zone)
-- Refresh tokens (Dex authproxy connector does not support them)
+- Refresh tokens: sign in again when the session ends
+- Third-party OIDC clients: White Rabbit is for CI/CD and the `rabbit` CLI only
 - Automatic endpoint discovery from bunny's OpenAPI specs
 - Multi-tenant isolation
 - Passwords or social login

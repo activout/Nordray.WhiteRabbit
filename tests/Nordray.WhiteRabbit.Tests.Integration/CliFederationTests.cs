@@ -9,14 +9,14 @@ using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.IdentityModel.Tokens;
 using Nordray.WhiteRabbit.Core.Models;
-using Nordray.WhiteRabbit.Core.Services;
+using Nordray.WhiteRabbit.Core.Federation;
 using Nordray.WhiteRabbit.Infrastructure.Database;
 using RichardSzalay.MockHttp;
 
 namespace Nordray.WhiteRabbit.Tests.Integration;
 
 /// <summary>
-/// The rabbit CLI flows end to end: token exchange for humans (Dex) and CI workloads (GitHub, Forgejo), virtual
+/// The rabbit CLI flows end to end: exchange for humans (/cli/login codes) and CI workloads (GitHub, Forgejo), virtual
 /// credentials, the Bunny proxy with a fake upstream, binding administration and the audit trail.
 /// </summary>
 public abstract class CliFederationTests : IAsyncLifetime
@@ -80,15 +80,38 @@ public abstract class CliFederationTests : IAsyncLifetime
     protected static string ForgejoToken(Dictionary<string, object>? claims = null) =>
         IdentityTokens.Create(WhiteRabbitFactory.ForgejoIssuer, WhiteRabbitFactory.FederationAudience, claims ?? IdentityTokens.ForgejoClaims());
 
-    protected static string DexToken(string email, string audience = WhiteRabbitFactory.CliClient, DateTime? issuedAt = null, TimeSpan? lifetime = null) =>
-        IdentityTokens.Create(WhiteRabbitFactory.Issuer, audience, new Dictionary<string, object> { ["sub"] = "dex-" + email, ["email"] = email }, issuedAt, lifetime);
+    /// <summary>A PKCE verifier as the rabbit CLI makes one: base64url of 32 random bytes.</summary>
+    protected const string Verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+    /// <summary>A code as /cli/login stores and hands to the CLI's loopback listener, bound to the verifier's S256 challenge.</summary>
+    protected async Task<string> LoginCodeAsync(string email, string verifier = Verifier, TimeSpan? lifetime = null)
+    {
+        await CreateUserAsync(email);
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var user = (await scope.ServiceProvider.GetRequiredService<IUserRepository>().FindByEmailAsync(email))!;
+        var code = OpaqueToken.Generate(OpaqueToken.LoginCodePrefix);
+        var now = DateTime.UtcNow;
+        await scope.ServiceProvider.GetRequiredService<ICliLoginCodeDao>().InsertAsync(new CliLoginCode
+        {
+            CodeHash = OpaqueToken.Hash(code),
+            CodeChallenge = Base64UrlEncoder.Encode(SHA256.HashData(System.Text.Encoding.ASCII.GetBytes(verifier))),
+            UserId = user.Id,
+            CreatedUtc = now,
+            ExpiresUtc = now + (lifetime ?? TimeSpan.FromMinutes(2)),
+        });
+        return code;
+    }
+
+    protected async Task<(HttpStatusCode Status, JsonElement Body)> ExchangeCodeAsync(string code, string? verifier = Verifier)
+    {
+        var response = await _client.PostAsJsonAsync("/api/cli/exchange", new { code, code_verifier = verifier });
+        return (response.StatusCode, await response.Content.ReadFromJsonAsync<JsonElement>());
+    }
 
     /// <summary>A signed-in human with a stored Bunny key and a session for the rabbit CLI.</summary>
-    protected async Task<string> HumanSessionAsync(params string[] grants)
+    protected async Task<string> HumanSessionAsync(string email = Email)
     {
-        await CreateUserAsync(Email);
-        if (grants.Length > 0) await GrantAsync(Email, WhiteRabbitFactory.CliClient, grants);
-        var (status, body) = await ExchangeAsync(DexToken(Email));
+        var (status, body) = await ExchangeCodeAsync(await LoginCodeAsync(email));
         Assert.Equal(HttpStatusCode.OK, status);
         return body.GetProperty("access_token").GetString()!;
     }
@@ -102,12 +125,6 @@ public abstract class CliFederationTests : IAsyncLifetime
         var user = (await users.FindByEmailAsync(email))!;
         var protector = scope.ServiceProvider.GetRequiredService<IDataProtectionProvider>().CreateProtector("BunnyApiKey.v1");
         await users.UpdateBunnyApiKeyAsync(user.Id, protector.Protect(RealBunnyKey));
-    }
-
-    protected async Task GrantAsync(string email, string client, params string[] capabilities)
-    {
-        await using var scope = _factory.Services.CreateAsyncScope();
-        await scope.ServiceProvider.GetRequiredService<IGrantService>().StoreGrantAsync(email, client, capabilities);
     }
 
     protected async Task<(HttpStatusCode Status, JsonElement Body)> ExchangeAsync(string token)
@@ -199,7 +216,7 @@ public abstract class CliFederationTests : IAsyncLifetime
         // Nor anywhere else in the database: sessions and keys are stored as hashes only.
         await using var connection = _db.Factory.Create();
         await connection.OpenAsync();
-        foreach (var table in new[] { "CliSessions", "VirtualCredentials", "SecurityEvents", "WorkloadBindings" })
+        foreach (var table in new[] { "CliLoginCodes", "CliSessions", "VirtualCredentials", "SecurityEvents", "WorkloadBindings" })
         {
             await using var command = connection.CreateCommand();
             command.CommandText = $"SELECT * FROM {table}";
@@ -226,10 +243,10 @@ public class CliFederationDiscoveryTests : CliFederationTests
 {
 
     [Fact]
-    public async Task Config_TellsTheCliItsClientAudienceAndCapabilities()
+    public async Task Config_TellsTheCliItsAudienceAndCapabilities()
     {
         var config = await _client.GetFromJsonAsync<JsonElement>("/api/cli/config");
-        Assert.Equal(WhiteRabbitFactory.CliClient, config.GetProperty("dex_client_id").GetString());
+        Assert.False(config.TryGetProperty("dex_client_id", out _));
         Assert.Equal(WhiteRabbitFactory.FederationAudience, config.GetProperty("federation_audience").GetString());
         Assert.Contains(config.GetProperty("capabilities").EnumerateArray(), c => c.GetProperty("name").GetString() == "statistics.read");
     }
@@ -250,12 +267,9 @@ public class CliFederationHumanExchangeTests : CliFederationTests
 {
 
     [Fact]
-    public async Task Human_ExchangeDexToken_GetsSessionWithGrantedCapabilities()
+    public async Task Human_LoginCode_GetsSessionWithEveryCapability()
     {
-        await CreateUserAsync(Email);
-        await GrantAsync(Email, WhiteRabbitFactory.CliClient, "statistics.read");
-
-        var (status, body) = await ExchangeAsync(DexToken(Email));
+        var (status, body) = await ExchangeCodeAsync(await LoginCodeAsync(Email));
 
         Assert.Equal(HttpStatusCode.OK, status);
         var token = body.GetProperty("access_token").GetString()!;
@@ -264,28 +278,64 @@ public class CliFederationHumanExchangeTests : CliFederationTests
 
         var whoami = await GetJsonAsync("/api/cli/whoami", token);
         Assert.Equal(Email, whoami.GetProperty("email").GetString());
-        Assert.Equal(["statistics.read"], whoami.GetProperty("capabilities").EnumerateArray().Select(e => e.GetString()));
-    }
-
-    [Theory]
-    [InlineData("example-client", "wrong_audience")]
-    [InlineData("whiterabbit:test", "wrong_audience")]
-    public async Task Human_DexTokenForAnotherAudience_IsDenied(string audience, string reason)
-    {
-        await CreateUserAsync(Email);
-        await AssertExchangeDenied(DexToken(Email, audience: audience), reason);
+        Assert.True(whoami.GetProperty("has_bunny_key").GetBoolean());
+        var capabilities = whoami.GetProperty("capabilities").EnumerateArray().Select(e => e.GetString()).ToList();
+        Assert.Contains("statistics.read", capabilities);
+        Assert.Contains("mc.manage", capabilities);
     }
 
     [Fact]
-    public async Task Human_OldDexToken_IsDeniedEvenIfStillValid() =>
-        await AssertExchangeDenied(
-            DexToken(Email, issuedAt: DateTime.UtcNow.AddMinutes(-20), lifetime: TimeSpan.FromHours(1)), "token_too_old");
+    public async Task Human_LoginCode_CanBeUsedOnlyOnce()
+    {
+        var code = await LoginCodeAsync(Email);
+        Assert.Equal(HttpStatusCode.OK, (await ExchangeCodeAsync(code)).Status);
+        await AssertCodeDenied(code, Verifier, "invalid_login_code");
+    }
+
+    [Fact]
+    public async Task Human_WrongVerifier_IsDeniedAndBurnsTheCode()
+    {
+        var code = await LoginCodeAsync(Email);
+        await AssertCodeDenied(code, "wrongwrongwrongwrongwrongwrongwrongwrongwro", "code_verifier_mismatch");
+        await AssertCodeDenied(code, Verifier, "invalid_login_code");
+    }
+
+    [Fact]
+    public async Task Human_MissingVerifier_IsDenied() =>
+        await AssertCodeDenied(await LoginCodeAsync(Email), null, "code_verifier_mismatch");
+
+    [Fact]
+    public async Task Human_ExpiredCode_IsDenied() =>
+        await AssertCodeDenied(await LoginCodeAsync(Email, lifetime: TimeSpan.FromSeconds(-1)), Verifier, "invalid_login_code");
+
+    [Fact]
+    public async Task Human_UnknownOrMalformedCode_IsDenied()
+    {
+        await AssertCodeDenied(OpaqueToken.Generate(OpaqueToken.LoginCodePrefix), Verifier, "invalid_login_code");
+        await AssertCodeDenied("not-a-code", Verifier, "invalid_login_code");
+    }
 
     [Fact]
     public async Task Human_NotOnAllowList_IsDenied()
     {
-        await CreateUserAsync("stranger@example.org");
-        await AssertExchangeDenied(DexToken("stranger@example.org"), "user_not_allowed");
+        var code = await LoginCodeAsync("stranger@example.org");
+        await AssertCodeDenied(code, Verifier, "user_not_allowed");
+    }
+
+    [Fact]
+    public async Task Exchange_CodeAndSubjectTokenTogether_IsRejected()
+    {
+        var response = await _client.PostAsJsonAsync("/api/cli/exchange", new { code = await LoginCodeAsync(Email), code_verifier = Verifier, subject_token = GitHubToken() });
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    private async Task AssertCodeDenied(string code, string? verifier, string reason)
+    {
+        var (status, body) = await ExchangeCodeAsync(code, verifier);
+        Assert.Equal(HttpStatusCode.Unauthorized, status);
+        Assert.Equal(reason, body.GetProperty("reason").GetString());
+        Assert.Contains(await SecurityEventsAsync(), e => (string?)e["EventType"] == "cli.exchange" && (string?)e["Reason"] == reason);
+        await AssertNoSecretsInAuditAsync(code, Verifier);
     }
 
 }
@@ -357,7 +407,7 @@ public class CliFederationGitHubWorkloadTests : CliFederationTests
         { "pr_ref", "ref_not_allowed" },
         { "environment", "no_matching_binding" },
         { "audience_prod", "wrong_audience" },
-        { "audience_dex_client", "wrong_audience" },
+        { "audience_cli_client", "wrong_audience" },
         { "unknown_issuer", "untrusted_issuer" },
         { "wrong_key", "invalid_signature" },
         { "expired", "token_expired" },
@@ -398,7 +448,7 @@ public class CliFederationGitHubWorkloadTests : CliFederationTests
                 break;
             case "environment": claims["environment"] = "staging"; break;
             case "audience_prod": audience = "whiterabbit:prod"; break;
-            case "audience_dex_client": audience = WhiteRabbitFactory.CliClient; break;
+            case "audience_cli_client": audience = "rabbit-cli"; break;
             case "unknown_issuer": issuer = "https://evil.example"; credentials = new SigningCredentials(WhiteRabbitFactory.IssuerKeys[WhiteRabbitFactory.GitHubIssuer], SecurityAlgorithms.RsaSha256); break;
             case "wrong_key": credentials = new SigningCredentials(new RsaSecurityKey(RSA.Create(2048)) { KeyId = "github-key" }, SecurityAlgorithms.RsaSha256); break;
             case "expired": issuedAt = DateTime.UtcNow.AddMinutes(-30); break;
@@ -516,7 +566,7 @@ public class CliFederationBindingAdministrationTests : CliFederationTests
     }
 
     [Fact]
-    public async Task Admin_VirtualKeyOrDexTokenOrCookieless_CannotUseCliOrAdminApi()
+    public async Task Admin_VirtualKeyOrIdentityTokenOrCookieless_CannotUseCliOrAdminApi()
     {
         var human = await HumanSessionAsync();
         var key = await CredentialAsync(human);
@@ -525,9 +575,9 @@ public class CliFederationBindingAdministrationTests : CliFederationTests
         withKey.Headers.Add("AccessKey", key);
         Assert.Equal(HttpStatusCode.Unauthorized, (await _client.SendAsync(withKey)).StatusCode);
 
-        var withDex = new HttpRequestMessage(HttpMethod.Get, "/api/cli/whoami");
-        withDex.Headers.Authorization = new AuthenticationHeaderValue("Bearer", WhiteRabbitFactory.Token());
-        Assert.Equal(HttpStatusCode.Unauthorized, (await _client.SendAsync(withDex)).StatusCode);
+        var withIdToken = new HttpRequestMessage(HttpMethod.Get, "/api/cli/whoami");
+        withIdToken.Headers.Authorization = new AuthenticationHeaderValue("Bearer", GitHubToken());
+        Assert.Equal(HttpStatusCode.Unauthorized, (await _client.SendAsync(withIdToken)).StatusCode);
 
         Assert.Equal(HttpStatusCode.Unauthorized, (await _client.GetAsync("/api/cli/whoami")).StatusCode);
     }
@@ -554,8 +604,7 @@ public class CliFederationBindingAdministrationTests : CliFederationTests
     {
         var human = await HumanSessionAsync();
         var (_, created) = await CreateBindingAsync(human, GitHubBinding());
-        await CreateUserAsync("other@" + WhiteRabbitFactory.AllowedDomain);
-        var other = (await ExchangeAsync(DexToken("other@" + WhiteRabbitFactory.AllowedDomain))).Body.GetProperty("access_token").GetString()!;
+        var other = await HumanSessionAsync("other@" + WhiteRabbitFactory.AllowedDomain);
 
         var response = await SendAsync(HttpMethod.Delete, $"/api/admin/bindings/{created.GetProperty("id").GetInt64()}", other);
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
@@ -570,8 +619,9 @@ public class CliFederationCredentialsAndProxyTests : CliFederationTests
     [Fact]
     public async Task Credentials_CannotBeBroaderThanTheSession()
     {
-        var human = await HumanSessionAsync(grants: "statistics.read");
-        var response = await SendAsync(HttpMethod.Post, "/api/cli/credentials", human, new { capabilities = new[] { "statistics.read", "dns.write" } });
+        await CreateBindingAsync(await HumanSessionAsync(), GitHubBinding()); // statistics.read only
+        var workload = (await ExchangeAsync(GitHubToken())).Body.GetProperty("access_token").GetString()!;
+        var response = await SendAsync(HttpMethod.Post, "/api/cli/credentials", workload, new { capabilities = new[] { "statistics.read", "dns.write" } });
         Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
         Assert.Contains("dns.write", await response.Content.ReadAsStringAsync());
     }
@@ -579,7 +629,7 @@ public class CliFederationCredentialsAndProxyTests : CliFederationTests
     [Fact]
     public async Task Credentials_NarrowedKey_CannotUseOtherCapabilities()
     {
-        var human = await HumanSessionAsync(grants: ["statistics.read", "dns.read"]);
+        var human = await HumanSessionAsync();
         var key = await CredentialAsync(human, "dns.read");
 
         var response = await ProxyAsync(key, "/proxy/api.bunny.net/statistics");
@@ -589,19 +639,9 @@ public class CliFederationCredentialsAndProxyTests : CliFederationTests
     }
 
     [Fact]
-    public async Task Proxy_RevokedGrant_TakesEffectImmediately()
-    {
-        var human = await HumanSessionAsync(grants: "statistics.read");
-        var key = await CredentialAsync(human);
-        await GrantAsync(Email, WhiteRabbitFactory.CliClient, "dns.read"); // replaces the earlier grant
-
-        Assert.Equal(HttpStatusCode.Forbidden, (await ProxyAsync(key, "/proxy/api.bunny.net/statistics")).StatusCode);
-    }
-
-    [Fact]
     public async Task Proxy_ExpiredVirtualKey_IsRejected()
     {
-        var human = await HumanSessionAsync(grants: "statistics.read");
+        var human = await HumanSessionAsync();
         var key = await CredentialAsync(human);
         await ExecuteAsync("UPDATE VirtualCredentials SET ExpiresUtc = '2000-01-01 00:00:00.000'");
 
@@ -621,9 +661,9 @@ public class CliFederationCredentialsAndProxyTests : CliFederationTests
     [Fact]
     public async Task Proxy_SessionTokenIsNotAProxyCredential()
     {
-        var human = await HumanSessionAsync(grants: "statistics.read");
+        var human = await HumanSessionAsync();
         var response = await SendAsync(HttpMethod.Get, "/proxy/api.bunny.net/statistics", human);
-        // Only Dex tokens are read from Authorization on proxy routes; a session token is not a credential there.
+        // The proxy reads only AccessKey; a session token in Authorization is not a credential there.
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
         Assert.Empty(_upstreamRequests);
     }
@@ -631,7 +671,7 @@ public class CliFederationCredentialsAndProxyTests : CliFederationTests
     [Fact]
     public async Task Proxy_UnsupportedOperation_IsNotFoundEvenWithAValidKey_AndAudited()
     {
-        var human = await HumanSessionAsync(grants: "statistics.read");
+        var human = await HumanSessionAsync();
         Assert.Equal(HttpStatusCode.NotFound, (await ProxyAsync(await CredentialAsync(human), "/proxy/api.bunny.net/apikey?secret=x")).StatusCode);
 
         var denied = (await SecurityEventsAsync()).Single(e => (string?)e["Reason"] == "unsupported_operation");
@@ -649,7 +689,7 @@ public class CliFederationCredentialsAndProxyTests : CliFederationTests
     [InlineData("/api/cli/credentials", "null", "application/json", HttpStatusCode.BadRequest)]
     public async Task MalformedBodies_AreRejectedNotTreatedAsEmpty(string path, string body, string contentType, HttpStatusCode expected)
     {
-        var human = await HumanSessionAsync(grants: "statistics.read");
+        var human = await HumanSessionAsync();
         var request = new HttpRequestMessage(HttpMethod.Post, path) { Content = new StringContent(body, System.Text.Encoding.UTF8, contentType) };
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", human);
 
@@ -673,7 +713,7 @@ public class CliFederationCredentialsAndProxyTests : CliFederationTests
     [Fact]
     public async Task Revoke_EndsSessionAndItsKeys()
     {
-        var human = await HumanSessionAsync(grants: "statistics.read");
+        var human = await HumanSessionAsync();
         var key = await CredentialAsync(human);
 
         Assert.Equal(HttpStatusCode.NoContent, (await SendAsync(HttpMethod.Post, "/api/cli/revoke", human)).StatusCode);
@@ -685,7 +725,7 @@ public class CliFederationCredentialsAndProxyTests : CliFederationTests
     [Fact]
     public async Task Revoke_OneCredential_LeavesTheSession()
     {
-        var human = await HumanSessionAsync(grants: "statistics.read");
+        var human = await HumanSessionAsync();
         var credential = await (await SendAsync(HttpMethod.Post, "/api/cli/credentials", human)).Content.ReadFromJsonAsync<JsonElement>();
 
         var response = await SendAsync(HttpMethod.Post, "/api/cli/revoke", human, new { credential_id = credential.GetProperty("credential_id").GetString() });
@@ -729,7 +769,7 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     public async Task McAppGet_RedactsEnvironmentValuesButKeepsIds()
     {
         _upstream = _ => Json(AppWithSecrets);
-        var key = await CredentialAsync(await HumanSessionAsync(grants: "mc.read"));
+        var key = await CredentialAsync(await HumanSessionAsync(), "mc.read");
 
         var response = await ProxyAsync(key, "/proxy/api.bunny.net/mc/apps/app-1");
         var body = await response.Content.ReadAsStringAsync();
@@ -750,7 +790,7 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     public async Task McRegistryList_RedactsPasswordFragments()
     {
         _upstream = _ => Json("""{"items":[{"id":7,"hostName":"codebahn.net","isPublic":false,"firstPasswordSymbols":"ab","lastPasswordSymbols":"yz"}]}""");
-        var key = await CredentialAsync(await HumanSessionAsync(grants: "mc.read"));
+        var key = await CredentialAsync(await HumanSessionAsync(), "mc.read");
 
         var body = await (await ProxyAsync(key, "/proxy/api.bunny.net/mc/registries")).Content.ReadAsStringAsync();
 
@@ -764,14 +804,14 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     public async Task McDeploy_RequiresMcDeploy_ForwardsTheBody_AndRedactsTheAnswer()
     {
         _upstream = _ => Json("""{"id":"c-api","image":"new","environmentVariables":[{"name":"X","value":"secret-3"}]}""");
-        var readOnly = await CredentialAsync(await HumanSessionAsync(grants: "mc.read"));
+        var human = await HumanSessionAsync();
+        var readOnly = await CredentialAsync(human, "mc.read");
         var patch = """{"image":"codebahn.net/activout/nordray-access:def"}""";
 
         Assert.Equal(HttpStatusCode.Forbidden, (await SendWithKeyAsync(HttpMethod.Patch, "/proxy/api.bunny.net/mc/apps/app-1/containers/c-api", readOnly, patch)).StatusCode);
         Assert.Empty(_upstreamRequests);
 
-        await GrantAsync(Email, WhiteRabbitFactory.CliClient, "mc.read", "mc.deploy");
-        var deployer = await CredentialAsync((await ExchangeAsync(DexToken(Email))).Body.GetProperty("access_token").GetString()!);
+        var deployer = await CredentialAsync(human, "mc.read", "mc.deploy");
         var response = await SendWithKeyAsync(HttpMethod.Patch, "/proxy/api.bunny.net/mc/apps/app-1/containers/c-api", deployer, patch);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -783,7 +823,7 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     public async Task McRedactedRoute_UnparsableSuccess_IsNotPassedThrough()
     {
         _upstream = _ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("NORDRAY_VAULT_STORAGE_PASSWORD=vault-secret-1") };
-        var key = await CredentialAsync(await HumanSessionAsync(grants: "mc.read"));
+        var key = await CredentialAsync(await HumanSessionAsync(), "mc.read");
 
         var response = await ProxyAsync(key, "/proxy/api.bunny.net/mc/apps/app-1");
 
@@ -805,7 +845,7 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     [InlineData("""{"entryPoint":{"command":"sh"}}""", "entryPoint")]
     public async Task McDeploy_CanChangeOnlyTheImage(string patch, string refusedField)
     {
-        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.deploy", "mc.env"]));
+        var key = await CredentialAsync(await HumanSessionAsync(), "mc.deploy", "mc.env");
 
         var response = await SendWithKeyAsync(HttpMethod.Patch, "/proxy/api.bunny.net/mc/apps/app-1/containers/c-api", key, patch);
 
@@ -823,7 +863,7 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     public async Task McDeploy_ImageFieldsAreForwarded_InAnyCase()
     {
         _upstream = _ => Json("""{"id":"c-api"}""");
-        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.deploy"]));
+        var key = await CredentialAsync(await HumanSessionAsync(), "mc.deploy");
         var patch = """{"ImageTag":"def","imageRegistryId":"reg-1","imageNamespace":"activout","imageName":"x","imagePullPolicy":"Always"}""";
 
         var response = await SendWithKeyAsync(HttpMethod.Patch, "/proxy/api.bunny.net/mc/apps/app-1/containers/c-api", key, patch);
@@ -844,7 +884,7 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     public async Task EnvSet_PlaceholdersKeepTheirCurrentValues_AndTheAnswerIsRedacted()
     {
         ContainerWithSecretsUpstream();
-        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.read", "mc.env"]));
+        var key = await CredentialAsync(await HumanSessionAsync(), "mc.read", "mc.env");
 
         // What `bunny apps env set NEW …` sends after reading the (redacted) container through White Rabbit.
         var response = await SendWithKeyAsync(HttpMethod.Put, EnvPath, key,
@@ -869,7 +909,7 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     public async Task EnvSet_WithoutPlaceholders_IsForwardedUnchanged_WithoutReadingFirst()
     {
         ContainerWithSecretsUpstream();
-        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.env"]));
+        var key = await CredentialAsync(await HumanSessionAsync(), "mc.env");
         var env = """{"MODE":"prod"}""";
 
         Assert.Equal(HttpStatusCode.OK, (await SendWithKeyAsync(HttpMethod.Put, EnvPath, key, env)).StatusCode);
@@ -882,7 +922,7 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     public async Task EnvSet_PlaceholderForAnUnknownVariable_IsRefused()
     {
         ContainerWithSecretsUpstream();
-        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.env"]));
+        var key = await CredentialAsync(await HumanSessionAsync(), "mc.env");
 
         var response = await SendWithKeyAsync(HttpMethod.Put, EnvPath, key, """{"OTHER":"[redacted by White Rabbit]"}""");
 
@@ -898,7 +938,7 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     public async Task EnvSet_WhenTheCurrentValuesCannotBeRead_NothingIsWritten()
     {
         _upstream = _ => Json("""{"error":"nope"}""", HttpStatusCode.NotFound);
-        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.env"]));
+        var key = await CredentialAsync(await HumanSessionAsync(), "mc.env");
 
         var response = await SendWithKeyAsync(HttpMethod.Put, EnvPath, key, """{"DB_TOKEN":"[redacted by White Rabbit]"}""");
 
@@ -913,7 +953,7 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     [InlineData("not json")]
     public async Task EnvSet_BodyMustBeAnObjectOfStrings(string body)
     {
-        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.env"]));
+        var key = await CredentialAsync(await HumanSessionAsync(), "mc.env");
 
         var response = await SendWithKeyAsync(HttpMethod.Put, EnvPath, key, body);
 
@@ -925,7 +965,7 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     public async Task AppCreate_AnswerIsRedacted()
     {
         _upstream = _ => Json("""{"id":"app-9","containerTemplates":[{"id":"c","environmentVariables":[{"name":"K","value":"create-secret-4"}]}]}""", HttpStatusCode.Created);
-        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.manage"]));
+        var key = await CredentialAsync(await HumanSessionAsync(), "mc.manage");
 
         var response = await SendWithKeyAsync(HttpMethod.Post, "/proxy/api.bunny.net/mc/apps", key, """{"name":"preview-42"}""");
 
@@ -949,11 +989,10 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     public async Task NewOperations_NeedTheirOwnCapability(string method, string path, string capability)
     {
         var others = new[] { "db.read", "db.manage", "db.token", "mc.read", "mc.deploy", "mc.env", "mc.manage" }.Where(c => c != capability).ToArray();
-        var without = await CredentialAsync(await HumanSessionAsync(grants: others));
+        var without = await CredentialAsync(await HumanSessionAsync(), others);
         Assert.Equal(HttpStatusCode.Forbidden, (await SendWithKeyAsync(new HttpMethod(method), path, without, method is "GET" or "DELETE" ? null : "{}")).StatusCode);
 
-        await GrantAsync(Email, WhiteRabbitFactory.CliClient, capability);
-        var with = await CredentialAsync((await ExchangeAsync(DexToken(Email))).Body.GetProperty("access_token").GetString()!);
+        var with = await CredentialAsync(await HumanSessionAsync(), capability);
         Assert.Equal(HttpStatusCode.OK, (await SendWithKeyAsync(new HttpMethod(method), path, with, method is "GET" or "DELETE" ? null : "{}")).StatusCode);
     }
 
@@ -965,7 +1004,7 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
     [InlineData("POST", "/proxy/api.bunny.net/database/v1/groups/g-1/auth/generate")]
     public async Task DeliberatelyUnsupportedOperations_AreNotFound(string method, string path)
     {
-        var key = await CredentialAsync(await HumanSessionAsync(grants: ["mc.read", "mc.deploy", "mc.env", "mc.manage", "db.read", "db.manage", "db.token"]));
+        var key = await CredentialAsync(await HumanSessionAsync(), "mc.read", "mc.deploy", "mc.env", "mc.manage", "db.read", "db.manage", "db.token");
         Assert.Equal(HttpStatusCode.NotFound, (await SendWithKeyAsync(new HttpMethod(method), path, key, method is "GET" or "DELETE" ? null : "{}")).StatusCode);
         Assert.Empty(_upstreamRequests);
     }
@@ -980,25 +1019,63 @@ public class CliFederationMagicContainersAndDatabaseTests : CliFederationTests
 
 }
 
-public class CliFederationDexPkceTests : CliFederationTests
+public class CliFederationBunnyKeyTests : CliFederationTests
 {
+    private const string NewKey = "real-new-bunny-key-abcdef0123456789";
 
-    [Theory]
-    [InlineData("client_id=rabbit-cli&response_type=code&redirect_uri=http://127.0.0.1:5000/callback", HttpStatusCode.BadRequest)]
-    [InlineData("client_id=rabbit-cli&response_type=code&code_challenge=abc&code_challenge_method=plain", HttpStatusCode.BadRequest)]
-    [InlineData("client_id=rabbit-cli&response_type=token&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256", HttpStatusCode.BadRequest)]
-    [InlineData("client_id=rabbit-cli&response_type=code&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256", HttpStatusCode.Redirect)]
-    [InlineData("client_id=example-client&response_type=code", HttpStatusCode.Redirect)]
-    // Repeated parameters: White Rabbit and Dex could read different values, so they are refused outright.
-    [InlineData("client_id=rabbit-cli&client_id=example-client&response_type=code", HttpStatusCode.BadRequest)]
-    [InlineData("client_id=example-client&client_id=rabbit-cli&response_type=code", HttpStatusCode.BadRequest)]
-    [InlineData("client_id=rabbit-cli&response_type=code&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&code_challenge_method=plain", HttpStatusCode.BadRequest)]
-    public async Task DexAuth_RabbitCliRequiresPkceS256(string query, HttpStatusCode expected)
+    [Fact]
+    public async Task SetKey_IsUsedUpstream_AndNeverEchoedOrAudited()
     {
-        var response = await _client.GetAsync("/auth?" + query);
-        Assert.Equal(expected, response.StatusCode);
-        if (expected == HttpStatusCode.Redirect)
-            Assert.StartsWith("/login", response.Headers.Location!.OriginalString); // reaches the normal login
+        var human = await HumanSessionAsync();
+        var response = await SendAsync(HttpMethod.Put, "/api/admin/bunny-key", human, new { api_key = NewKey });
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        Assert.Empty(await response.Content.ReadAsStringAsync());
+
+        Assert.Equal(HttpStatusCode.OK, (await ProxyAsync(await CredentialAsync(human, "statistics.read"), "/proxy/api.bunny.net/statistics")).StatusCode);
+        Assert.Equal(NewKey, Assert.Single(_upstreamRequests).Headers.GetValues("AccessKey").Single());
+
+        Assert.Contains(await SecurityEventsAsync(), e => (string?)e["EventType"] == "admin.bunny_key.set" && (string?)e["Outcome"] == "allowed");
+        await AssertNoSecretsInAuditAsync(NewKey);
+        await using var connection = _db.Factory.Create();
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT BunnyApiKey FROM Users";
+        Assert.DoesNotContain(NewKey, (string)(await command.ExecuteScalarAsync())!);
     }
 
+    [Fact]
+    public async Task RemoveKey_ProxyThenRefuses()
+    {
+        var human = await HumanSessionAsync();
+        Assert.Equal(HttpStatusCode.NoContent, (await SendAsync(HttpMethod.Delete, "/api/admin/bunny-key", human)).StatusCode);
+        Assert.False((await GetJsonAsync("/api/cli/whoami", human)).GetProperty("has_bunny_key").GetBoolean());
+
+        var response = await ProxyAsync(await CredentialAsync(human, "statistics.read"), "/proxy/api.bunny.net/statistics");
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Contains("bunny_api_key_not_configured", await response.Content.ReadAsStringAsync());
+        Assert.Empty(_upstreamRequests);
+    }
+
+    [Theory]
+    [InlineData("""{"api_key":""}""")]
+    [InlineData("""{"api_key":"has space"}""")]
+    [InlineData("""{}""")]
+    public async Task SetKey_Invalid_IsRejected(string body)
+    {
+        var human = await HumanSessionAsync();
+        var request = new HttpRequestMessage(HttpMethod.Put, "/api/admin/bunny-key") { Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json") };
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", human);
+        Assert.Equal(HttpStatusCode.BadRequest, (await _client.SendAsync(request)).StatusCode);
+    }
+
+    [Fact]
+    public async Task WorkloadSession_CannotSetOrRemoveTheKey()
+    {
+        await CreateBindingAsync(await HumanSessionAsync(), GitHubBinding());
+        var workload = (await ExchangeAsync(GitHubToken())).Body.GetProperty("access_token").GetString()!;
+
+        Assert.Equal(HttpStatusCode.Forbidden, (await SendAsync(HttpMethod.Put, "/api/admin/bunny-key", workload, new { api_key = NewKey })).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await SendAsync(HttpMethod.Delete, "/api/admin/bunny-key", workload)).StatusCode);
+        Assert.True((await GetJsonAsync("/api/cli/whoami", workload)).GetProperty("has_bunny_key").GetBoolean());
+    }
 }
