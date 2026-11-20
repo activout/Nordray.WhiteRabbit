@@ -117,37 +117,17 @@ Rules:
 - Incoming path templates are White Rabbit's own — they are not copied blindly from bunny.
 - If `CredentialKind` is not `None`, the proxy injects the correct credential before forwarding.
 
-### Starter capability list
+### Capabilities and registry entries
+
+The capabilities and their descriptions live in `BunnyOperationRegistry` (the README's table lists them). Examples:
 
 ```
-pullzone.read
-pullzone.write
-dns.read
-dns.write
-statistics.read
-shield.read
-shield.write
-mc.read
-mc.deploy
-mc.env
-mc.manage
-db.read
-db.manage
-db.token
-```
-
-### Example registry entries
-
-```
-GET  /proxy/core/pullzone              -> capability: pullzone.read
-POST /proxy/core/pullzone              -> capability: pullzone.write
-GET  /proxy/core/statistics            -> capability: statistics.read
-GET  /proxy/core/region                -> RequiresAuthenticationOnly = true
-GET  /proxy/core/user                  -> account.read
-GET  /proxy/core/dns                   -> capability: dns.read
-POST /proxy/core/dns                   -> capability: dns.write
-GET  /proxy/shield                     -> capability: shield.read
-POST /proxy/shield                     -> capability: shield.write
+GET    /proxy/api.bunny.net/region          -> RequiresAuthenticationOnly = true
+GET    /proxy/api.bunny.net/user            -> account.read
+GET    /proxy/api.bunny.net/statistics      -> statistics.read
+GET    /proxy/api.bunny.net/pullzone        -> pullzone.read
+POST   /proxy/api.bunny.net/pullzone/{id}   -> pullzone.write
+DELETE /proxy/api.bunny.net/pullzone/{id}   -> pullzone.write
 ```
 
 ---
@@ -379,31 +359,22 @@ Additional protections:
 
 ## Bunny credential injection
 
-Credentials are read from environment variables at startup and held in memory. They must:
-- never be written to logs
-- never be returned in any HTTP response body or header
-- be selected based on `BunnyOperation.CredentialKind`
+Each owner's bunny.net account API key is set with `rabbit admin key set` (`PUT /api/admin/bunny-key`), protected
+with ASP.NET Data Protection (purpose `BunnyApiKey.v1`, key ring in the database) and stored in `Users.BunnyApiKey`.
+`BunnyProxyGate` decrypts it per request for operations with `CredentialKind = AccountApiKey` and sets it as
+`AccessKey`. It must:
+- never be written to logs or SecurityEvents
+- never be returned in any HTTP response body or header (`whoami` reports only `has_bunny_key`)
 
-| CredentialKind | Env var | Bunny header |
-|---|---|---|
-| `AccountApiKey` | `WHITE_RABBIT_BUNNY_ACCOUNT_API_KEY` | `AccessKey` |
-| `StorageZonePassword` | `WHITE_RABBIT_BUNNY_STORAGE_PASSWORD` | `AccessKey` |
-| `StreamApiKey` | `WHITE_RABBIT_BUNNY_STREAM_API_KEY` | `AccessKey` |
-| `None` | — | — |
+Only `AccountApiKey` is used; the other `BunnyCredentialKind` values are reserved.
 
 ---
 
-## Build order
-
-v1 is built. New work follows the rules above; new bunny endpoints need a reviewed registry entry and tests.
-
-
-## Do not build first
+## Out of scope
 
 - Automatic OpenAPI-driven proxy generation
 - Generic proxy configuration outside the registry
 - OpenFGA or resource-level scoping
-- Complex admin UI
 - Third-party OIDC clients, a consent screen, or an OIDC provider (Dex was removed on purpose)
 - A web admin UI (the `rabbit` CLI is the admin interface)
 - Password login or social login
@@ -420,17 +391,3 @@ Services:
 Persistent volumes:
 - `./data/white-rabbit/white-rabbit.db` — local libSQL database file
 
----
-
-## Definition of done for v1
-
-- A user can sign in via emailed code, and the `rabbit` CLI through `/cli/login`
-- The owner can store their bunny.net key and manage workload bindings from the CLI
-- GitHub Actions and Forgejo Actions jobs matching a binding get virtual credentials
-- At least Core Platform + Shield bunny endpoints can be proxied successfully
-- Unsupported routes are denied (404)
-- Capability-protected routes are enforced (403)
-- Requests without a virtual credential are refused (401)
-- Audit events are written for every proxy decision
-- The app runs locally with Docker Compose
-- The app can be deployed as a single bunny.net Magic Containers container
